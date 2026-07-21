@@ -41,7 +41,7 @@ type Config = {
   mcp?: { configPath?: string; stages?: Record<string, string[]> };
   // Optional pre-fetch of external debugging context (for the `fetch` command).
   // Deterministic, not agent/MCP-driven: pulls one upload job's MongoDB document
-  // and its matching Sentry events into context/<id>.{md,json}. Requires the
+  // and its matching Sentry events into context/<id>/context.{md,json}. Requires the
   // SENTRY_AUTH_TOKEN and MONGODB_URI credentials (see .env.example) — the fetch
   // preflight in runFetchCommand fails fast if either is unset. Omit this block
   // and the `fetch` command is simply unavailable. See pipeline/fetch-context.ts.
@@ -1624,7 +1624,7 @@ async function runNamedStage(stage: Stage, ticketId: string, ctx: Ctx): Promise<
 }
 
 // Deterministic pre-fetch: pull one upload job's MongoDB document and its
-// matching Sentry events, then write context/<id>.{md,json}. No agent, no MCP —
+// matching Sentry events, then write context/<id>/context.{md,json}. No agent, no MCP —
 // scripted orchestrator code (pipeline/fetch-context.ts). Fails fast on a bad
 // id, a missing `fetch` config block, or missing credentials, mirroring the MCP
 // credential preflight in main().
@@ -1634,9 +1634,8 @@ async function runFetchCommand(uploadJobId: string): Promise<void> {
   const config = readConfig();
   if (!config.fetch) {
     throw new Error(
-      "sdlc.config.json has no `fetch` block. Add one (see " +
-        "docs/superpowers/specs/2026-07-20-invoice-submission-context-prefetch-design.md) " +
-        "before running `fetch`.",
+      "sdlc.config.json has no `fetch` block. Add one (see the `_comment_fetch` " +
+        "note in sdlc.config.json) before running `fetch`.",
     );
   }
 
@@ -1676,7 +1675,7 @@ async function main(): Promise<void> {
   const [command, ticketId, overrideStage, ...rest] = args;
 
   // `fetch <uploadJobId>` — deterministic pre-fetch of a job's MongoDB + Sentry
-  // debugging context into context/<id>.{md,json}. Kept separate from `run` so
+  // debugging context into context/<id>/context.{md,json}. Kept separate from `run` so
   // the fetch can be iterated in isolation. The ticketId positional slot carries
   // the upload job id here.
   if (command === "fetch") {

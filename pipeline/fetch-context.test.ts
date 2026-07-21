@@ -415,9 +415,12 @@ test("renderContextMarkdown renders a per-project fetch error, not a false 'no e
 // ---------------------------------------------------------------------------
 // writeContextArtifacts
 // ---------------------------------------------------------------------------
-test("writeContextArtifacts writes parseable json and markdown", () => {
+test("writeContextArtifacts nests both files in a per-id subfolder", () => {
   const dir = mkdtempSync(join(tmpdir(), "fetchctx-"));
   const { mdPath, jsonPath } = writeContextArtifacts(sampleContext(), dir);
+  // Both artifacts live under context/<id>/, with source-agnostic basenames.
+  assert.ok(jsonPath.endsWith(`${VALID_ID}/context.json`), jsonPath);
+  assert.ok(mdPath.endsWith(`${VALID_ID}/context.md`), mdPath);
   const parsed = JSON.parse(readFileSync(jsonPath, "utf8"));
   assert.equal(parsed.uploadJobId, VALID_ID);
   const md = readFileSync(mdPath, "utf8");

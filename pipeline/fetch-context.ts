@@ -1,8 +1,8 @@
 // Pre-fetch debugging context for a single invoice-submission upload job.
 //
 // Given an upload job _id, this module pulls that job's MongoDB document and its
-// matching Sentry events, then writes a local artifact (context/<id>.md +
-// context/<id>.json) that a later phase injects into stage prompts.
+// matching Sentry events, then writes a local artifact (context/<id>/context.md +
+// context/<id>/context.json) that a later phase injects into stage prompts.
 //
 // Design: PURE normalizers (curateJob, normalizeSentryEvent, renderSentryQuery,
 // renderContextMarkdown) are separated from thin I/O wrappers. All I/O is
@@ -524,9 +524,13 @@ export function writeContextArtifacts(
   ctx: JobContext,
   outDir = "context",
 ): { mdPath: string; jsonPath: string } {
-  mkdirSync(outDir, { recursive: true });
-  const jsonPath = `${outDir}/${ctx.uploadJobId}.json`;
-  const mdPath = `${outDir}/${ctx.uploadJobId}.md`;
+  // One folder per upload job, named by its id, holding both artifacts — keeps a
+  // job's context self-contained and the context/ root uncluttered. The two files
+  // still each combine Mongo + Sentry (source split by section/key, not by file).
+  const dir = `${outDir}/${ctx.uploadJobId}`;
+  mkdirSync(dir, { recursive: true });
+  const jsonPath = `${dir}/context.json`;
+  const mdPath = `${dir}/context.md`;
   writeFileSync(jsonPath, JSON.stringify(ctx, null, 2));
   writeFileSync(mdPath, renderContextMarkdown(ctx));
   return { mdPath, jsonPath };
