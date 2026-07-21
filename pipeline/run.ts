@@ -13,6 +13,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { runChecks, runE2E, GateResult, checkReview, checkCoverage } from "./gates";
 import { checkBundle, PRODUCT_KB_SPEC } from "./kb-conformance";
+import {
+  fetchUploadJobContext,
+  writeContextArtifacts,
+  validateUploadJobId,
+  REQUIRED_FETCH_ENV,
+  type FetchConfig,
+} from "./fetch-context";
 
 type StageMode = "manual" | "approve" | "auto";
 type ProjectConfig = { productPath: string; knowledgePath: string };
@@ -32,6 +39,13 @@ type Config = {
   // in main(). Servers are always loaded with --strict-mcp-config (reproducible;
   // ignores desktop/user/claude.ai connectors).
   mcp?: { configPath?: string; stages?: Record<string, string[]> };
+  // Optional pre-fetch of external debugging context (for the `fetch` command).
+  // Deterministic, not agent/MCP-driven: pulls one upload job's MongoDB document
+  // and its matching Sentry events into context/<id>.{md,json}. Requires the
+  // SENTRY_AUTH_TOKEN and MONGODB_URI credentials (see .env.example) — the fetch
+  // preflight in runFetchCommand fails fast if either is unset. Omit this block
+  // and the `fetch` command is simply unavailable. See pipeline/fetch-context.ts.
+  fetch?: FetchConfig;
 };
 
 type ProductComponent = { path: string; check: string; test?: string };
@@ -1609,6 +1623,48 @@ async function runNamedStage(stage: Stage, ticketId: string, ctx: Ctx): Promise<
   }
 }
 
+// Deterministic pre-fetch: pull one upload job's MongoDB document and its
+// matching Sentry events, then write context/<id>.{md,json}. No agent, no MCP —
+// scripted orchestrator code (pipeline/fetch-context.ts). Fails fast on a bad
+// id, a missing `fetch` config block, or missing credentials, mirroring the MCP
+// credential preflight in main().
+async function runFetchCommand(uploadJobId: string): Promise<void> {
+  validateUploadJobId(uploadJobId);
+
+  const config = readConfig();
+  if (!config.fetch) {
+    throw new Error(
+      "sdlc.config.json has no `fetch` block. Add one (see " +
+        "docs/superpowers/specs/2026-07-20-invoice-submission-context-prefetch-design.md) " +
+        "before running `fetch`.",
+    );
+  }
+
+  loadEnvFile(resolve(".env"));
+  const missing = REQUIRED_FETCH_ENV.filter((v) => !process.env[v]);
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing credential(s) for the fetch: ${missing.join(", ")}.\n` +
+        `Set them in this repo's .env (see .env.example) or your environment before running.`,
+    );
+  }
+
+  console.log(`\nFetching debug context for upload job ${uploadJobId}...`);
+  const jobCtx = await fetchUploadJobContext(uploadJobId, config.fetch, {
+    authToken: process.env.SENTRY_AUTH_TOKEN,
+    mongoUri: process.env.MONGODB_URI,
+  });
+
+  const sentryCount = jobCtx.sentry.reduce((n, s) => n + s.events.length, 0);
+  const { mdPath, jsonPath } = writeContextArtifacts(jobCtx);
+  console.log(`  Mongo:  job ${jobCtx.mongo ? "found" : "NOT found"} (status: ${jobCtx.mongo?.status ?? "?"})`);
+  console.log(`  Sentry: ${sentryCount} event(s) across ${jobCtx.sentry.length} project(s)`);
+  for (const s of jobCtx.sentry) {
+    if (s.error) console.log(`    - ${s.project}: fetch error — ${s.error}`);
+  }
+  console.log(`\nWrote:\n  ${mdPath}\n  ${jsonPath}`);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   // The stage override is a plain positional argument, not a --flag:
@@ -1619,8 +1675,25 @@ async function main(): Promise<void> {
   // no such gotcha — it always reaches process.argv unmodified.
   const [command, ticketId, overrideStage, ...rest] = args;
 
+  // `fetch <uploadJobId>` — deterministic pre-fetch of a job's MongoDB + Sentry
+  // debugging context into context/<id>.{md,json}. Kept separate from `run` so
+  // the fetch can be iterated in isolation. The ticketId positional slot carries
+  // the upload job id here.
+  if (command === "fetch") {
+    const uploadJobId = ticketId;
+    if (!uploadJobId || overrideStage || rest.length > 0) {
+      console.error("Usage: npm run sdlc fetch <uploadJobId>");
+      process.exit(1);
+    }
+    await runFetchCommand(uploadJobId);
+    return;
+  }
+
   if (command !== "run" || !ticketId) {
-    console.error("Usage: npm run sdlc run <ticketId> [stageName]");
+    console.error(
+      "Usage: npm run sdlc run <ticketId> [stageName]\n" +
+        "       npm run sdlc fetch <uploadJobId>",
+    );
     process.exit(1);
   }
 

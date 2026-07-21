@@ -19,3 +19,9 @@ node_modules/
 /retros/
 /curator/
 /events.jsonl
+
+# Pre-fetched debug context (npm run sdlc fetch). Contains REAL customer invoice
+# data + Sentry stack traces — stays local, never committed. The folder is kept
+# via .gitkeep so it always exists for the fetch to write into.
+/context/*
+!/context/.gitkeep

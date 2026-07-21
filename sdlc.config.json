@@ -20,5 +20,18 @@
     "stages": {
       "spec": ["mcp__MongoDB__*"]
     }
+  },
+  "_comment_fetch": "Optional pre-fetch of external debugging context for the `npm run sdlc fetch <uploadJobId>` command. Deterministic (not agent/MCP-driven): pulls the upload job's MongoDB document and its matching Sentry events into context/<id>.{md,json}. Requires SENTRY_AUTH_TOKEN (Sentry User Auth Token / Internal Integration with scopes event:read, project:read, org:read) and MONGODB_URI in this repo's .env (see .env.example). sentry.queryTemplate substitutes {id} with the job id — confirmed live to be the Sentry tag 'uploadJobId:{id}' on upload-invoice events. sentry.statsPeriod for the issues endpoint accepts ONLY '', '24h', or '14d' (a Sentry API limitation — '90d' returns HTTP 400). Remove this block to disable the command.",
+  "fetch": {
+    "sentry": {
+      "org": "monto-e1c13a9a2",
+      "regionUrl": "https://us.sentry.io",
+      "projects": ["upload-invoice"],
+      "queryTemplate": "uploadJobId:{id}",
+      "statsPeriod": "14d",
+      "maxIssues": 25,
+      "maxEventsPerIssue": 5
+    },
+    "mongo": { "database": "MontoProd", "collection": "upload_jobs" }
   }
 }
