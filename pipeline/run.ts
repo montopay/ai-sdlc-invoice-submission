@@ -7,10 +7,19 @@
 // Usage:
 //   npm run sdlc run 001
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  readFileSync,
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  writeFileSync,
+  unlinkSync,
+  readdirSync,
+} from "node:fs";
 import { resolve, relative, sep, isAbsolute } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
+import { randomUUID } from "node:crypto";
 import { runChecks, runE2E, GateResult, checkReview, checkCoverage } from "./gates";
 import { checkBundle, PRODUCT_KB_SPEC } from "./kb-conformance";
 import {
@@ -18,6 +27,10 @@ import {
   writeContextArtifacts,
   validateUploadJobId,
   REQUIRED_FETCH_ENV,
+  makeSentryGet,
+  makeSentryBinaryGet,
+  downloadJobArtifacts,
+  buildReproduceInput,
   type FetchConfig,
 } from "./fetch-context";
 
@@ -46,6 +59,18 @@ type Config = {
   // preflight in runFetchCommand fails fast if either is unset. Omit this block
   // and the `fetch` command is simply unavailable. See pipeline/fetch-context.ts.
   fetch?: FetchConfig;
+  // Optional config for the ON-DEMAND `reproduce` command: run the real scraper
+  // headed against a failing job to reproduce it / validate a fix. `command` is run
+  // in `cwd` with `env` applied (e.g. HEADED=true, SKIP_MONGO=true); the orchestrator
+  // builds a self-contained input from the Mongo step, prompts for the portal password,
+  // and passes it via the child's env INPUT payload (never written to disk/logs).
+  // Consumed by runReproduceCommand.
+  reproduce?: {
+    command: string;
+    cwd: string;
+    env?: Record<string, string>;
+    passwordPrompt?: string;
+  };
 };
 
 type ProductComponent = { path: string; check: string; test?: string };
@@ -69,6 +94,11 @@ type Ctx = {
   config: Config;
   paths: Paths;
   descriptor: ProductDescriptor;
+  // Unique id for THIS orchestrator run: `${Date.now()}-${uuid8}`. Minted once in
+  // main(), stamped into the run_started event, the run.lock.json mutex, and every
+  // approval request.json so the dashboard/derive can scope approvals to the live
+  // run and the startup sweep can discard stale ones from prior runs.
+  runId: string;
 };
 
 type RetryContext = { priorAttempt: string; feedback: string };
@@ -102,7 +132,7 @@ const MAX_REVIEW_ATTEMPTS = 3;
 // The pipeline's fixed stage sequence. Both the auto-resume logic and the
 // default run order in main() walk this same list, so adding a stage
 // later (deploy) means adding it here once.
-const STAGE_ORDER = ["parse", "spec", "implement", "review", "test", "qa"] as const;
+const STAGE_ORDER = ["reproduce", "investigate", "spec", "implement", "review", "test", "qa"] as const;
 type Stage = (typeof STAGE_ORDER)[number];
 
 function readConfig(): Config {
@@ -153,6 +183,31 @@ function readSpec(id: string): string {
     throw new Error(`No spec found at ${path}. Run the spec stage first.`);
   }
   return readFileSync(path, "utf8");
+}
+
+// The investigate stage's input: the debug context fetched for this upload job
+// (the ticketId IS the uploadJobId in the debugging flow). Fails with a clear
+// instruction if `fetch` hasn't run yet.
+function readInvestigateContext(id: string): string {
+  const path = `context/${id}/context.md`;
+  if (!existsSync(path)) {
+    throw new Error(
+      `No fetched context at ${path}. Run \`npm run sdlc fetch ${id}\` first ` +
+        `(or \`npm run sdlc debug ${id}\`, which fetches then runs).`,
+    );
+  }
+  let out = readFileSync(path, "utf8");
+  // Fold in the live reproduction result when the reproduce stage produced one.
+  const reproPath = `context/${id}/reproduce.md`;
+  if (existsSync(reproPath)) out += "\n\n---\n\n" + readFileSync(reproPath, "utf8");
+  return out;
+}
+
+// investigate's approved output (root cause + remediation acceptance criteria) is
+// saved AS the ticket, so spec/implement/review consume it unchanged via readTicket.
+function writeInvestigation(id: string, output: string): void {
+  mkdirSync("tickets", { recursive: true });
+  writeFileSync(`tickets/${id}.md`, `# Investigation — upload job ${id}\n\n${output}\n`);
 }
 
 // Creates (or, on a rerun, switches to) an isolated feature branch before
@@ -387,6 +442,10 @@ function callAgent(
     allowedTools?: string[];
     maxTurns?: number;
     addDir?: string;
+    // Additional readable roots beyond addDir (each becomes another --add-dir).
+    // addDir stays the KB dir (kb_read telemetry keys on it); extraDirs are e.g.
+    // the fetched context/<id>/ dir handed to the investigate stage.
+    extraDirs?: string[];
     // Absolute path to an .mcp.json giving this stage's agent live (MCP) tools.
     // When set, callAgent passes --mcp-config <path> --strict-mcp-config.
     mcpConfig?: string;
@@ -403,7 +462,10 @@ function callAgent(
   // it through quoteCommandLine into one quoted command string. Building it here
   // means the path is individually quoted on Windows (spaces-safe) and DEP0190
   // stays avoided. Do NOT move this into the spawn/command-string call sites.
-  const dirArgs = opts?.addDir ? ["--add-dir", opts.addDir] : [];
+  const dirArgs = [
+    ...(opts?.addDir ? ["--add-dir", opts.addDir] : []),
+    ...(opts?.extraDirs ?? []).flatMap((d) => ["--add-dir", d]),
+  ];
   // Load MCP servers for this stage from an EXPLICIT config path (a project
   // .mcp.json auto-loads only after an interactive trust prompt — useless for a
   // headless run). --strict-mcp-config makes the agent ignore every OTHER MCP
@@ -545,6 +607,271 @@ async function promptText(question: string): Promise<string> {
   return answer.trim();
 }
 
+// ---- Dashboard control plane: approvals (file <-> HTTP handoff) ----
+
+// Repo-root-relative paths for a given pause, keyed by <TICKET>__<STAGE>. The
+// dashboard server writes the decision.json; the orchestrator writes the
+// request.json (and, for generic stages, a preview.md). These three files ARE
+// the approval channel — see the SHARED CONTRACT.
+function approvalPaths(ticket: string, stage: string): {
+  request: string;
+  decision: string;
+  preview: string;
+} {
+  const key = `${ticket}__${stage}`;
+  return {
+    request: `approvals/${key}.request.json`,
+    decision: `approvals/${key}.decision.json`,
+    preview: `approvals/${key}.preview.md`,
+  };
+}
+
+// process.kill(pid, 0) probes liveness without signalling: it throws ESRCH when
+// the pid is gone, EPERM when it exists but we can't signal it (still alive).
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: unknown) {
+    return (e as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+// A human approval that can arrive from EITHER the terminal (readline y/n, when a
+// TTY is present) OR the dashboard (a decision.json the server wrote in response
+// to a POST /command). Both race under a single settle-once guard so whichever
+// answers first wins and the other is torn down cleanly — no leaked readline on
+// stdin, no stale control files left behind. Returns which path settled it.
+//
+// The portal PASSWORD is deliberately NOT part of this channel: it is prompted
+// only over the terminal in doReproduce (never file-channelled). This gate only
+// carries the approve/reject decision (+ optional feedback on reject).
+async function awaitApproval(
+  ctx: Ctx,
+  args: {
+    ticket: string;
+    stage: string;
+    attempt: number;
+    question: string;
+    // Repo-root-relative path the dashboard fetches as /data/<previewPath> to show
+    // the produced output. "" when there's nothing to preview (reproduce).
+    previewPath: string;
+    wantFeedback: boolean;
+  }
+): Promise<{ approved: boolean; feedback?: string; via: "terminal" | "dashboard" }> {
+  const { ticket, stage, attempt, question, previewPath, wantFeedback } = args;
+  const paths = approvalPaths(ticket, stage);
+
+  mkdirSync("approvals", { recursive: true });
+  // Clear any leftover decision from a prior pause so the interval can't pick up
+  // a stale answer before the human acts on THIS request.
+  if (existsSync(paths.decision)) {
+    try {
+      unlinkSync(paths.decision);
+    } catch {
+      /* best effort */
+    }
+  }
+
+  const promptId = randomUUID();
+  const request = {
+    ticket,
+    stage,
+    attempt,
+    promptId,
+    runId: ctx.runId,
+    ts: new Date().toISOString(),
+    question,
+    previewPath,
+    wantFeedback,
+  };
+  writeFileSync(paths.request, JSON.stringify(request, null, 2));
+  emitEvent("awaiting_approval", { ticket, stage, runId: ctx.runId, promptId, attempt });
+
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    let interval: ReturnType<typeof setInterval>;
+    let rl: ReturnType<typeof createInterface> | undefined;
+    const ac = new AbortController();
+
+    const cleanup = () => {
+      clearInterval(interval);
+      ac.abort(); // reject any pending terminal question so its await unwinds
+      if (rl) {
+        try {
+          rl.close();
+        } catch {
+          /* already closed */
+        }
+      }
+      // Tear down the control files for this pause (request + decision + the
+      // orchestrator-owned preview.md). previewPath in the request may point at a
+      // persisted artifact (e.g. reviews/<id>.md for review) — we NEVER delete
+      // that; only the approvals/<key>.preview.md we may have written.
+      for (const p of [paths.request, paths.decision, paths.preview]) {
+        try {
+          if (existsSync(p)) unlinkSync(p);
+        } catch {
+          /* best effort */
+        }
+      }
+    };
+
+    const settle = (result: { approved: boolean; feedback?: string; via: "terminal" | "dashboard" }) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolvePromise(result);
+    };
+
+    // (1) File source: poll for the server-written decision.json.
+    interval = setInterval(() => {
+      if (settled) return;
+      if (!existsSync(paths.decision)) return;
+      let dec: any;
+      try {
+        dec = JSON.parse(readFileSync(paths.decision, "utf8"));
+      } catch {
+        return; // torn/partial write — keep waiting, don't crash
+      }
+      if (!dec || dec.promptId !== promptId) {
+        // A decision for a DIFFERENT prompt (stale) — discard it and keep waiting.
+        try {
+          unlinkSync(paths.decision);
+        } catch {
+          /* best effort */
+        }
+        return;
+      }
+      settle({
+        approved: dec.decision === "approve",
+        feedback: typeof dec.feedback === "string" ? dec.feedback : "",
+        via: "dashboard",
+      });
+    }, 300);
+
+    // (2) Terminal source: only when a real TTY is attached. Uses an AbortSignal
+    // so a dashboard win can cancel the pending question and free stdin.
+    if (process.stdin.isTTY) {
+      rl = createInterface({ input: process.stdin, output: process.stdout });
+      (async () => {
+        const ans = await rl!.question(`${question} (y/n) `, { signal: ac.signal });
+        if (settled) return;
+        if (ans.trim().toLowerCase().startsWith("y")) {
+          settle({ approved: true, via: "terminal" });
+          return;
+        }
+        let feedback = "";
+        if (wantFeedback) {
+          const fb = await rl!.question("What should change? ", { signal: ac.signal });
+          if (settled) return;
+          feedback = fb.trim();
+        }
+        settle({ approved: false, feedback, via: "terminal" });
+      })().catch(() => {
+        // Expected when a dashboard decision settled first: ac.abort() rejects the
+        // pending question. Swallow it — settle() already resolved the outer promise.
+      });
+    }
+  });
+}
+
+// ---- Run mutex + startup sweep (dashboard control plane) ----
+
+// Acquires the single-run lock BEFORE the stage loop. A live lock (its pid still
+// alive) means another run owns the pipeline — refuse and exit non-zero. A dead
+// pid is a stale lock from a crashed run — overwrite it. The server also reads
+// this file to fail fast on POST /command {cmd:"start"}, but the orchestrator is
+// authoritative: it re-acquires here.
+function acquireRunLock(ctx: Ctx, ticket: string): void {
+  mkdirSync("approvals", { recursive: true });
+  const lockPath = "approvals/run.lock.json";
+  if (existsSync(lockPath)) {
+    try {
+      const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+      if (typeof lock.pid === "number" && lock.pid !== process.pid && isPidAlive(lock.pid)) {
+        console.error(
+          `a run is already in progress (pid ${lock.pid}, ticket ${lock.ticket ?? "?"}). ` +
+            `Wait for it to finish, or remove ${resolve(lockPath)} if you're sure it's stale.`
+        );
+        process.exit(1);
+      }
+      // Otherwise the lock is stale (dead pid / our own pid) — fall through and overwrite.
+    } catch {
+      // Unreadable lock — treat as stale and overwrite.
+    }
+  }
+  writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: process.pid, ticket, runId: ctx.runId, startedAt: new Date().toISOString() }, null, 2)
+  );
+}
+
+// Releases the lock at the end of the run — but ONLY if it's still ours (runId
+// matches). If a later run legitimately overwrote a stale lock we'd otherwise
+// delete theirs.
+function releaseRunLock(ctx: Ctx): void {
+  const lockPath = "approvals/run.lock.json";
+  try {
+    if (!existsSync(lockPath)) return;
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    if (lock.runId === ctx.runId) unlinkSync(lockPath);
+  } catch {
+    /* best effort */
+  }
+}
+
+// Deletes leftover approval control files from PRIOR runs so the dashboard never
+// shows a pause that no longer belongs to the live run. A request.json whose
+// embedded runId != ours is stale; its sibling decision.json/preview.md go with
+// it. Then any orphan decision.json/preview.md (no matching request) is swept
+// too. run.lock.json is left to the mutex.
+function sweepStaleApprovals(runId: string): void {
+  const dir = "approvals";
+  if (!existsSync(dir)) return;
+  const suffixes = [".request.json", ".decision.json", ".preview.md"];
+
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".request.json")) continue;
+    const key = name.slice(0, -".request.json".length);
+    let stale = true;
+    try {
+      const req = JSON.parse(readFileSync(`${dir}/${name}`, "utf8"));
+      stale = req.runId !== runId;
+    } catch {
+      stale = true; // unreadable request — treat as stale
+    }
+    if (stale) {
+      for (const suffix of suffixes) {
+        const p = `${dir}/${key}${suffix}`;
+        try {
+          if (existsSync(p)) unlinkSync(p);
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+  }
+
+  // Orphan decision/preview files (their request is gone) — clean them up.
+  for (const name of readdirSync(dir)) {
+    const suffix = name.endsWith(".decision.json")
+      ? ".decision.json"
+      : name.endsWith(".preview.md")
+        ? ".preview.md"
+        : null;
+    if (!suffix) continue;
+    const key = name.slice(0, -suffix.length);
+    if (!existsSync(`${dir}/${key}.request.json`)) {
+      try {
+        unlinkSync(`${dir}/${name}`);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
 function logRun(entry: Record<string, unknown>): void {
   appendFileSync("runlog.jsonl", JSON.stringify(entry) + "\n");
 }
@@ -611,6 +938,11 @@ type StageOptions = {
   // root. Set on the KB-reading stages (parse/spec/review); test does NOT read
   // the KB (it works from the spec + code), and qa is deterministic.
   usesKb?: boolean;
+  // Extra absolute directories (beyond the KB) to grant the agent read access to,
+  // as additional --add-dir roots. Used by investigate to read the fetched
+  // context/<id>/ dir (context.md + downloaded failure artifacts) which lives in
+  // the pipeline repo, outside the agent's product-repo cwd.
+  extraReadDirs?: string[];
 };
 
 // Generic stage runner: build the prompt, call the agent, show the
@@ -652,7 +984,7 @@ function requiredMcpEnvVars(mcpText: string): string[] {
   return [...req];
 }
 
-async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext): Promise<void> {
+async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext, attempt = 1): Promise<void> {
   const startedAt = Date.now();
   const input = opts.getInput();
   const kb = opts.usesKb ? readKbIndex(ctx.paths.knowledgeDir) : undefined;
@@ -667,6 +999,7 @@ async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext): Pro
     cwd: ctx.paths.workdir,
     allowedTools: opts.allowedTools ? [...opts.allowedTools, ...mcp.tools] : opts.allowedTools,
     addDir: kb ? kb.dir : undefined,
+    extraDirs: opts.extraReadDirs,
     mcpConfig: mcp.mcpConfig,
     ticket: opts.ticketId,
     stage: opts.stage,
@@ -694,17 +1027,29 @@ async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext): Pro
     return;
   }
 
-  // The pipeline is now blocked on a human y/n at the terminal. Emit telemetry
-  // so a live UI can show this stage as "waiting for approval" rather than
-  // "running" — the confirm() below produces no other signal while it blocks.
-  emitEvent("awaiting_approval", { ticket: opts.ticketId, stage: opts.stage });
-  const approved = await confirm("Approve this output?");
-  if (approved) {
+  // The pipeline is now blocked on a human decision, answerable from EITHER the
+  // terminal or the dashboard (awaitApproval races both). The generic stage's
+  // artifact isn't persisted until approval, so write a preview.md the dashboard
+  // can fetch; awaitApproval emits the awaiting_approval telemetry and tears the
+  // preview down on settle.
+  const paths = approvalPaths(opts.ticketId, opts.stage);
+  mkdirSync("approvals", { recursive: true });
+  writeFileSync(paths.preview, output);
+
+  const decision = await awaitApproval(ctx, {
+    ticket: opts.ticketId,
+    stage: opts.stage,
+    attempt,
+    question: "Approve this output?",
+    previewPath: paths.preview,
+    wantFeedback: true,
+  });
+  if (decision.approved) {
     save();
     return;
   }
 
-  const feedback = await promptText("What should change?");
+  const feedback = decision.feedback ?? "";
   logRun({
     stage: opts.stage,
     ticket: opts.ticketId,
@@ -716,23 +1061,31 @@ async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext): Pro
   emitEvent("stage_finished", { ticket: opts.ticketId, stage: opts.stage, approved: false, durationMs: Date.now() - startedAt });
 
   console.log(`\nRe-running ${opts.stage} agent with your feedback...\n`);
-  await runStage(opts, ctx, { priorAttempt: output, feedback });
+  await runStage(opts, ctx, { priorAttempt: output, feedback }, attempt + 1);
 }
 
-function runStageParse(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+function runStageInvestigate(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
   return runStage(
     {
-      stage: "parse",
+      stage: "investigate",
       ticketId,
       mode,
-      roleFile: "agents/parse.md",
-      getInput: () => readTicket(ticketId),
-      // Read-scoped now that it gets a readable root into the KB repo — parse
-      // returns its output as text (the orchestrator appends it), so it never
-      // needed write tools, and this keeps it from writing to the KB.
-      allowedTools: ["Read"],
+      roleFile: "agents/investigate.md",
+      // Input is the fetched debug context (Mongo + Sentry + downloaded failure
+      // artifacts) written by `fetch` to context/<id>/. ticketId IS the uploadJobId.
+      getInput: () => readInvestigateContext(ticketId),
+      // Read-scoped: investigate reads the context + KB + scraper source and emits a
+      // diagnosis; it writes nothing itself (the orchestrator saves the ticket).
+      // Grep/Glob let it search the KB (esp. cases/) by portal + error signature.
+      allowedTools: ["Read", "Grep", "Glob"],
       usesKb: true,
-      onApprove: (output) => appendFileSync(`tickets/${ticketId}.md`, "\n" + output + "\n"),
+      // Grant read access to the fetched context dir (pipeline-repo-local, outside
+      // the agent's product-repo cwd) so it can open context.md AND the downloaded
+      // error-screenshot / recording under context/<id>/artifacts/.
+      extraReadDirs: [resolve(`context/${ticketId}`)],
+      // Save the diagnosis + remediation criteria (AC-N) AS the ticket, so
+      // spec/implement/review consume it unchanged via readTicket.
+      onApprove: (output) => writeInvestigation(ticketId, output),
     },
     ctx
   );
@@ -976,9 +1329,19 @@ async function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Prom
       writeReview(ticketId, output);
 
       if (mode !== "approve") break;
-      emitEvent("awaiting_approval", { ticket: ticketId, stage: "review" });
-      if (await confirm("Approve this review?")) break;
-      retry = { priorAttempt: output, feedback: await promptText("What should change?") };
+      // Review's artifact IS persisted (reviews/<id>.md, just written) — so the
+      // dashboard previews that path directly and NO approvals preview.md is
+      // written. Pass the real belt attempt so the UI can attribute the pause.
+      const decision = await awaitApproval(ctx, {
+        ticket: ticketId,
+        stage: "review",
+        attempt,
+        question: "Approve this review?",
+        previewPath: `reviews/${ticketId}.md`,
+        wantFeedback: true,
+      });
+      if (decision.approved) break;
+      retry = { priorAttempt: output, feedback: decision.feedback ?? "" };
     }
 
     // Deterministic blocker gate — runs regardless of mode.
@@ -1563,6 +1926,25 @@ function stageEnabled(ctx: Ctx, stage: Stage): boolean {
   return ctx.config.stages[stage]?.enabled !== false;
 }
 
+// The stages that produce or act on a CODE fix. When investigate returns a "no-fix"
+// verdict these are skipped, so the run finishes at the learning loop instead.
+const FIX_STAGES: ReadonlySet<Stage> = new Set(["spec", "implement", "review", "test", "qa"]);
+
+// Investigate declares a machine-readable verdict line in its ticket, e.g.
+// `Resolution: no-fix (business)` or `Resolution: code-fix (scraper)`. A **no-fix**
+// verdict — a business error (obsolete PO, PO needs confirmation, …), a portal-side
+// change, or a transient/timeout — means there is nothing to change in code, so the fix
+// stages (see FIX_STAGES) are skipped and the pipeline goes straight to the learning
+// loop, which still records the case + KB update. Absence of the marker is NOT no-fix
+// (safe default: never skip a fix we might need). investigate is approve-gated, so a
+// human has vetted this verdict before we act on it. Tolerant of markdown bold / list
+// prefixes: matches "Resolution: no-fix", "- **Resolution:** no fix", etc.
+function investigateIsNoFix(ticketId: string): boolean {
+  const path = `tickets/${ticketId}.md`;
+  if (!existsSync(path)) return false;
+  return /^\s*[-*]?\s*\**\s*Resolution\**\s*:\s*\**\s*no[-\s]?fix\b/im.test(readFileSync(path, "utf8"));
+}
+
 // Runs one named stage if it's configured in sdlc.config.json, skipping
 // it (with a note) otherwise — same behavior main() already had per
 // stage, just centralized so main() can loop over STAGE_ORDER instead of
@@ -1585,10 +1967,26 @@ async function runNamedStage(stage: Stage, ticketId: string, ctx: Ctx): Promise<
     return;
   }
 
+  // Dynamic per-run skip: when investigate concluded there is no code change to make
+  // (a "no-fix" verdict in its ticket), skip the fix stages and let the run fall through
+  // to the learning loop, which still records the case + KB update. investigate and
+  // reproduce are never skipped this way (they're not in FIX_STAGES).
+  if (FIX_STAGES.has(stage) && investigateIsNoFix(ticketId)) {
+    console.log(
+      `Skipping ${stage} — investigate returned a no-fix verdict (no code change needed); ` +
+        `the run will finish at the learning loop and record the case.`,
+    );
+    emitEvent("stage_skipped", { ticket: ticketId, stage, reason: "no-fix" });
+    return;
+  }
+
   try {
     switch (stage) {
-      case "parse":
-        await runStageParse(ticketId, stageConfig.mode, ctx);
+      case "reproduce":
+        await runStageReproduce(ticketId, stageConfig.mode, ctx);
+        return;
+      case "investigate":
+        await runStageInvestigate(ticketId, stageConfig.mode, ctx);
         return;
       case "spec":
         await runStageSpec(ticketId, stageConfig.mode, ctx);
@@ -1654,6 +2052,26 @@ async function runFetchCommand(uploadJobId: string): Promise<void> {
     mongoUri: process.env.MONGODB_URI,
   });
 
+  // Best-effort: download the failure artifacts attached to the job's Sentry events —
+  // the error screenshot(s) AND the page.html DOM snapshot(s) — into context/<id>/
+  // artifacts/ (same SENTRY_AUTH_TOKEN — no S3, no extra creds), so the investigate
+  // stage can open the PNG or Grep/Read the HTML.
+  const token = process.env.SENTRY_AUTH_TOKEN as string;
+  const jobDir = `context/${uploadJobId}`;
+  jobCtx.artifacts = await downloadJobArtifacts(
+    jobCtx,
+    config.fetch,
+    {
+      jsonGet: makeSentryGet(config.fetch.sentry.regionUrl, token),
+      binGet: makeSentryBinaryGet(config.fetch.sentry.regionUrl, token),
+    },
+    jobDir,
+  );
+  if (jobCtx.artifacts.length) {
+    const ok = jobCtx.artifacts.filter((a) => a.localPath).length;
+    console.log(`  Artifacts: ${ok}/${jobCtx.artifacts.length} (screenshot + page.html) from Sentry → ${jobDir}/artifacts/`);
+  }
+
   const sentryCount = jobCtx.sentry.reduce((n, s) => n + s.events.length, 0);
   const { mdPath, jsonPath } = writeContextArtifacts(jobCtx);
   console.log(`  Mongo:  job ${jobCtx.mongo ? "found" : "NOT found"} (status: ${jobCtx.mongo?.status ?? "?"})`);
@@ -1664,6 +2082,207 @@ async function runFetchCommand(uploadJobId: string): Promise<void> {
   console.log(`\nWrote:\n  ${mdPath}\n  ${jsonPath}`);
 }
 
+// ON-DEMAND: run the REAL scraper headed against a failing job to reproduce it or
+// validate a fix. Deterministic orchestrator code (no agent). Requires `fetch` to
+// have run (requires context/<id>/ to exist). Prompts for the portal password and
+// passes it to the child ONLY via the env INPUT payload — never written to disk or a
+// log. The input is built COMPLETE from the Mongo step (the upload_jobs aggregation)
+// with directInvoiceSubmission forced false, so the scraper runs with no MongoDB of
+// its own (SKIP_MONGO) and never files a live invoice (draft only).
+// Tee a child's stdout+stderr to BOTH the terminal (live) and a captured string
+// (tail-capped), returning the exit code — so the human watches the headed run live
+// while the pipeline keeps a copy for the investigate agent.
+const REPRODUCE_LOG_CAP = 64 * 1024;
+function spawnTee(
+  command: string,
+  opts: { cwd: string; env: NodeJS.ProcessEnv },
+): Promise<{ exitCode: number | null; output: string }> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, { cwd: opts.cwd, env: opts.env, shell: true });
+    let output = "";
+    const onData = (chunk: Buffer) => {
+      const s = chunk.toString();
+      process.stdout.write(s);
+      output += s;
+      if (output.length > REPRODUCE_LOG_CAP) output = output.slice(-REPRODUCE_LOG_CAP);
+    };
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    child.on("error", reject);
+    child.on("close", (code) => resolvePromise({ exitCode: code, output }));
+  });
+}
+
+function renderReproduceMd(
+  uploadJobId: string,
+  portalName: string,
+  command: string,
+  exitCode: number | null,
+  output: string,
+): string {
+  return [
+    `# Local reproduction — upload job ${uploadJobId}`,
+    "",
+    `_Ran ${new Date().toISOString()}_`,
+    "",
+    `- **Portal:** ${portalName}`,
+    `- **Command:** \`${command}\` (HEADED, draft-only — never submits)`,
+    `- **Exit code:** ${exitCode} — a NON-ZERO exit usually means the failure reproduced; compare the error below to the Sentry error in context.md.`,
+    "",
+    "## Console output (tail)",
+    "",
+    "```",
+    output.trim() || "(no output captured)",
+    "```",
+    "",
+  ].join("\n");
+}
+
+// Core reproduce: build a self-contained input from the Mongo step, prompt for the
+// password, run the real scraper HEADED (draft-only), and CAPTURE the result to
+// context/<id>/reproduce.md so the investigate stage can read it. Throws on setup
+// errors (missing context/creds/cwd). Returns the exit code + artifact path.
+async function doReproduce(uploadJobId: string, config: Config): Promise<{ exitCode: number | null; mdPath: string }> {
+  if (!config.reproduce) throw new Error("sdlc.config.json has no `reproduce` block (see its _comment_reproduce note).");
+  if (!config.fetch) throw new Error("reproduce builds its input from the `fetch.mongo` config, which is missing.");
+
+  const jobDir = `context/${uploadJobId}`;
+  if (!existsSync(`${jobDir}/context.json`)) {
+    throw new Error(`No fetched context at ${jobDir}/context.json. Run \`npm run sdlc fetch ${uploadJobId}\` first.`);
+  }
+
+  loadEnvFile(resolve(".env"));
+  const mongoUri = process.env.MONGODB_URI;
+  if (!mongoUri) {
+    throw new Error("MONGODB_URI is required in this repo's .env — reproduce builds the scraper input from the Mongo step.");
+  }
+
+  // The portal password is prompted STRICTLY over the terminal — never file-
+  // channelled. Without a TTY (e.g. a dashboard-triggered pause where nobody is at
+  // this console) there's no safe way to collect it, so fail loudly. In the
+  // reproduce STAGE the surrounding try/catch turns this into "continue without
+  // reproduction" (no hang); the standalone reproduce command surfaces it as an error.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      "reproduce needs a TTY for the portal password — run from a terminal, or set reproduce mode to skip"
+    );
+  }
+
+  const password = await promptText(config.reproduce.passwordPrompt ?? "Portal password");
+  if (!password) throw new Error("No password entered — aborting reproduce.");
+
+  // Build a SELF-CONTAINED input from the Mongo step (the upload_jobs aggregation), so
+  // the scraper does NOT re-hydrate and needs no MongoDB of its own (SKIP_MONGO).
+  const input: any = await buildReproduceInput(
+    mongoUri,
+    config.fetch.mongo.database,
+    config.fetch.mongo.collection,
+    uploadJobId,
+  );
+  if (!input) {
+    throw new Error(`Upload job ${uploadJobId} not found in ${config.fetch.mongo.database}.${config.fetch.mongo.collection}.`);
+  }
+  const portalName: string = input.portalName ?? "?";
+  input.portalUser = { ...input.portalUser, password };
+  // Force draft-only, and drop uploadJob so the scraper does NOT re-hydrate (input is complete).
+  input.invoiceFormValues = { ...input.invoiceFormValues, directInvoiceSubmission: false };
+  delete input.uploadJob;
+
+  const cwd = resolve(config.reproduce.cwd);
+  if (!existsSync(cwd)) throw new Error(`reproduce.cwd not found: ${cwd}`);
+  // Strip MONGODB_URI (and the cache URI) from the CHILD env. This repo's .env sets
+  // MONGODB_URI so the pipeline can build the input above, but the scraper reads
+  // `MONGODB_URI = process.env.MONGODB_URI || (SKIP_MONGO ? undefined : <ssm>)`, so an
+  // inherited value would defeat SKIP_MONGO — the scraper would then open its session
+  // cache (session-cache.cache) with our fetch-scoped creds and die on an unauthorized
+  // upsert. Removing it here (Node's --env-file can't override an already-set var) lets
+  // SKIP_MONGO resolve MONGODB_URI to undefined so the cache is null and no Mongo is
+  // touched — the no-Mongo mode the scraper is written for. The pipeline keeps its own.
+  // NB: this alone is not enough — @montopay/base-scraper's base_constants.ts resolves
+  // its OWN mongo URI at import and does NOT honor SKIP_MONGO, so with MONGODB_URI stripped
+  // it falls back to SSM and crashes before main(). reproduce.env sets NODE_ENV=test so that
+  // fallback returns "" instead. Both must stay in sync (see sdlc.config.json _comment_reproduce).
+  const { MONGODB_URI: _drop, CACHE_MONGODB_URI: _dropCache, ...childEnv } = process.env;
+  const env = { ...childEnv, ...(config.reproduce.env ?? {}), INPUT: JSON.stringify(input) };
+
+  console.log(`\nReproducing upload job ${uploadJobId} (${portalName}) — HEADED, draft-only.`);
+  console.log(`  $ ${config.reproduce.command}   (cwd: ${cwd})\n`);
+  const { exitCode, output } = await spawnTee(config.reproduce.command, { cwd, env });
+
+  mkdirSync(jobDir, { recursive: true });
+  const mdPath = `${jobDir}/reproduce.md`;
+  writeFileSync(mdPath, renderReproduceMd(uploadJobId, portalName, config.reproduce.command, exitCode, output));
+  return { exitCode, mdPath };
+}
+
+// Standalone `npm run sdlc reproduce <id>` — runs a reproduction directly.
+async function runReproduceCommand(uploadJobId: string): Promise<void> {
+  validateUploadJobId(uploadJobId);
+  const config = readConfig();
+  const { exitCode, mdPath } = await doReproduce(uploadJobId, config);
+  console.log(`\nReproduce exit ${exitCode}. Captured to ${mdPath}.`);
+  console.log(
+    exitCode === 0
+      ? "Completed (exit 0). If it did NOT reproduce, the failure may be prod-only (IP/proxy/portal state)."
+      : "Non-zero exit — a reproduced failure is expected here; investigate will compare it to the Sentry error.",
+  );
+}
+
+// Pipeline stage: OFFER a live reproduction before investigate (approve mode) and
+// capture its result to context/<id>/reproduce.md so investigate ingests it. Never
+// blocks the pipeline — a decline skips it, and a failed run is noted and continues.
+async function runStageReproduce(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
+  const startedAt = Date.now();
+  emitEvent("stage_started", { ticket: ticketId, stage: "reproduce", mode });
+  const finish = (extra: Record<string, unknown> = {}) => {
+    logRun({ stage: "reproduce", ticket: ticketId, mode, durationMs: Date.now() - startedAt, approved: true });
+    emitEvent("stage_finished", { ticket: ticketId, stage: "reproduce", approved: true, durationMs: Date.now() - startedAt, ...extra });
+  };
+
+  if (mode === "manual") {
+    console.log(`reproduce: manual mode — skipping (run \`npm run sdlc reproduce ${ticketId}\` yourself if needed).`);
+    return finish({ ran: false });
+  }
+
+  let run = true;
+  if (mode === "approve") {
+    // Reproduce's y/n gate is answerable from the dashboard too (via awaitApproval),
+    // but with NO feedback and NO preview — it's a "run it now?" decision, not an
+    // artifact to review. The portal password (needed only if approved) is prompted
+    // strictly over the terminal in doReproduce, never file-channelled.
+    const decision = await awaitApproval(ctx, {
+      ticket: ticketId,
+      stage: "reproduce",
+      attempt: 1,
+      question: `Run a live reproduction for job ${ticketId} now? (headed browser; needs the portal password + a Node 22 scraper install)`,
+      previewPath: "",
+      wantFeedback: false,
+    });
+    run = decision.approved;
+  }
+  if (!run) {
+    console.log("reproduce: skipped by operator.");
+    return finish({ ran: false });
+  }
+
+  try {
+    const { exitCode, mdPath } = await doReproduce(ticketId, ctx.config);
+    console.log(`\nreproduce: captured → ${mdPath} (exit ${exitCode}).`);
+    return finish({ ran: true, exitCode });
+  } catch (err) {
+    // Best-effort: note the failure so investigate knows a reproduction was attempted.
+    const msg = err instanceof Error ? err.message : String(err);
+    const jobDir = `context/${ticketId}`;
+    mkdirSync(jobDir, { recursive: true });
+    writeFileSync(
+      `${jobDir}/reproduce.md`,
+      `# Local reproduction — upload job ${ticketId}\n\n_Attempted ${new Date().toISOString()}_\n\n**Could not run:** ${msg}\n`,
+    );
+    console.log(`reproduce: could not run (${msg}) — noted to context/${ticketId}/reproduce.md; continuing.`);
+    return finish({ ran: false, error: msg });
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   // The stage override is a plain positional argument, not a --flag:
@@ -1672,26 +2291,43 @@ async function main(): Promise<void> {
   // (silently dropping it, with only a warning) unless the caller
   // remembers to add a "--" separator first. A bare positional arg has
   // no such gotcha — it always reaches process.argv unmodified.
-  const [command, ticketId, overrideStage, ...rest] = args;
+  const [rawCommand, ticketId, overrideStage, ...rest] = args;
+  let command = rawCommand;
 
   // `fetch <uploadJobId>` — deterministic pre-fetch of a job's MongoDB + Sentry
   // debugging context into context/<id>/context.{md,json}. Kept separate from `run` so
   // the fetch can be iterated in isolation. The ticketId positional slot carries
   // the upload job id here.
-  if (command === "fetch") {
+  // Single-job commands — the ticketId positional slot carries the uploadJobId.
+  if (command === "fetch" || command === "reproduce") {
     const uploadJobId = ticketId;
     if (!uploadJobId || overrideStage || rest.length > 0) {
-      console.error("Usage: npm run sdlc fetch <uploadJobId>");
+      console.error(`Usage: npm run sdlc ${command} <uploadJobId>`);
       process.exit(1);
     }
-    await runFetchCommand(uploadJobId);
+    if (command === "fetch") await runFetchCommand(uploadJobId);
+    else await runReproduceCommand(uploadJobId);
     return;
+  }
+
+  // `debug <uploadJobId>` = fetch the job's context, then run the pipeline with the
+  // uploadJobId as the ticketId. Falls through to the run body below.
+  if (command === "debug") {
+    if (!ticketId || overrideStage || rest.length > 0) {
+      console.error("Usage: npm run sdlc debug <uploadJobId>");
+      process.exit(1);
+    }
+    await runFetchCommand(ticketId);
+    console.log(`\n--- Running the debugging pipeline for ${ticketId} ---`);
+    command = "run"; // fall through
   }
 
   if (command !== "run" || !ticketId) {
     console.error(
       "Usage: npm run sdlc run <ticketId> [stageName]\n" +
-        "       npm run sdlc fetch <uploadJobId>",
+        "       npm run sdlc debug <uploadJobId>      (fetch + run)\n" +
+        "       npm run sdlc fetch <uploadJobId>\n" +
+        "       npm run sdlc reproduce <uploadJobId>  (headed; never submits)",
     );
     process.exit(1);
   }
@@ -1707,8 +2343,8 @@ async function main(): Promise<void> {
   }
 
   const config = readConfig();
-  if (!config.stages.parse) {
-    throw new Error("sdlc.config.json is missing a 'parse' stage entry");
+  if (!config.stages.investigate) {
+    throw new Error("sdlc.config.json is missing an 'investigate' stage entry");
   }
 
   const paths = resolvePaths(config);
@@ -1742,7 +2378,11 @@ async function main(): Promise<void> {
   }
 
   const descriptor = readProductDescriptor(paths.workdir);
-  const ctx: Ctx = { config, paths, descriptor };
+  // One id for this whole run — stamped into run_started, the run.lock.json mutex,
+  // and every approval request.json so the dashboard can scope pauses to the live
+  // run and the startup sweep can discard stale ones.
+  const runId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const ctx: Ctx = { config, paths, descriptor, runId };
 
   console.log(`\nTicket ${ticketId}`);
   console.log(`  Product:       ${descriptor.name} at ${paths.workdir}`);
@@ -1755,51 +2395,65 @@ async function main(): Promise<void> {
     console.log(`Resuming ticket ${ticketId} from stage "${startStage}" (per runlog.jsonl).`);
   }
 
-  emitEvent("run_started", {
-    ticket: ticketId,
-    product: descriptor.name,
-    knowledgeDir: paths.knowledgeDir,
-    startStage,
-    stages: [...STAGE_ORDER],
-    learning: !!ctx.config.learning?.enabled,
-  });
+  // Single-run mutex: refuse to start if another run is live (its pid alive),
+  // overwrite a stale lock otherwise. The dashboard's POST /command {cmd:"start"}
+  // also reads this file to fail fast, but the orchestrator is authoritative and
+  // re-acquires here. Released in the finally below, but ONLY if still ours.
+  acquireRunLock(ctx, ticketId);
+  // Discard leftover approval control files from prior runs (stale runId), so the
+  // dashboard never surfaces a pause that isn't part of THIS run.
+  sweepStaleApprovals(ctx.runId);
 
-  // Run the writing flow, CAPTURING (not immediately rethrowing) a stage failure
-  // so the learning loop can still run afterward — a belted/aborted ticket is the
-  // highest-signal input for the Retrospector, and skipping it on failure (the old
-  // behavior) meant the most instructive runs taught nothing.
-  let writingError: unknown = null;
   try {
-    const startIndex = STAGE_ORDER.indexOf(startStage);
-    for (let i = startIndex; i < STAGE_ORDER.length; i++) {
-      await runNamedStage(STAGE_ORDER[i], ticketId, ctx);
-    }
-  } catch (err) {
-    writingError = err;
-  }
-  const errText = writingError ? (writingError instanceof Error ? writingError.message : String(writingError)) : undefined;
+    emitEvent("run_started", {
+      ticket: ticketId,
+      runId: ctx.runId,
+      product: descriptor.name,
+      knowledgeDir: paths.knowledgeDir,
+      startStage,
+      stages: [...STAGE_ORDER],
+      learning: !!ctx.config.learning?.enabled,
+    });
 
-  // Learning loop, gated by config. The Retrospector aggregates what happened, on
-  // SUCCESS OR FAILURE. The product Curator judges it against the KB's conventions
-  // and proposes a conformance-checked branch for a human PR — but ONLY on a clean
-  // run: it must cite a product-canonical source, and unshipped work has none (its
-  // code sits on feature/<id>, which the conformance gate bans). Learning is
-  // advisory, so its own errors are caught and logged, never allowed to mask the
-  // real run outcome.
-  if (ctx.config.learning?.enabled) {
+    // Run the writing flow, CAPTURING (not immediately rethrowing) a stage failure
+    // so the learning loop can still run afterward — a belted/aborted ticket is the
+    // highest-signal input for the Retrospector, and skipping it on failure (the old
+    // behavior) meant the most instructive runs taught nothing.
+    let writingError: unknown = null;
     try {
-      await runStageRetrospector(ticketId, ctx, errText);
-      if (!writingError) await runCurator(ticketId, ctx, "product");
-    } catch (learnErr) {
-      console.error("Learning loop error (non-fatal):", learnErr instanceof Error ? learnErr.message : String(learnErr));
+      const startIndex = STAGE_ORDER.indexOf(startStage);
+      for (let i = startIndex; i < STAGE_ORDER.length; i++) {
+        await runNamedStage(STAGE_ORDER[i], ticketId, ctx);
+      }
+    } catch (err) {
+      writingError = err;
     }
-  }
+    const errText = writingError ? (writingError instanceof Error ? writingError.message : String(writingError)) : undefined;
 
-  if (writingError) {
-    emitEvent("run_finished", { ticket: ticketId, outcome: "failed", error: errText });
-    throw writingError;
+    // Learning loop, gated by config. The Retrospector aggregates what happened, on
+    // SUCCESS OR FAILURE. The product Curator judges it against the KB's conventions
+    // and proposes a conformance-checked branch for a human PR — but ONLY on a clean
+    // run: it must cite a product-canonical source, and unshipped work has none (its
+    // code sits on feature/<id>, which the conformance gate bans). Learning is
+    // advisory, so its own errors are caught and logged, never allowed to mask the
+    // real run outcome.
+    if (ctx.config.learning?.enabled) {
+      try {
+        await runStageRetrospector(ticketId, ctx, errText);
+        if (!writingError) await runCurator(ticketId, ctx, "product");
+      } catch (learnErr) {
+        console.error("Learning loop error (non-fatal):", learnErr instanceof Error ? learnErr.message : String(learnErr));
+      }
+    }
+
+    if (writingError) {
+      emitEvent("run_finished", { ticket: ticketId, outcome: "failed", error: errText });
+      throw writingError;
+    }
+    emitEvent("run_finished", { ticket: ticketId, outcome: "complete" });
+  } finally {
+    releaseRunLock(ctx);
   }
-  emitEvent("run_finished", { ticket: ticketId, outcome: "complete" });
 }
 
 main().catch((err) => {

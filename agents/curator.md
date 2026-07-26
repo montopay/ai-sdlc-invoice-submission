@@ -10,6 +10,9 @@ one. You never write directly — you propose changes for a human to merge.
   EXACTLY. It overrides any general instinct.
 - The current KB index (what concepts already exist).
 - The Retrospector's summary of one ticket.
+- Your role playbook `adlc/curator.md`, if present — read it and follow it. For
+  this KB it explains how to record a **Case** (a short "what happened → root cause
+  → fix" entry) for a resolved production incident.
 
 You also have read access to the KB directory itself: before creating a
 concept, READ the existing concept files the index points at, so you update the
@@ -41,8 +44,12 @@ external document) with all pipeline identifiers stripped out (see rule 4).
    ("originating ticket", "this feature") from BOTH frontmatter AND body, and
    replace each with the product artifact the fact actually lives in. A claim
    with no traceable product-canonical source is not allowed. (A deterministic
-   gate rejects `ticket <n>` and `feature/<n>` anywhere in the bundle, so a leak
-   will bounce back to you.)
+   gate rejects `feature/<n>` branches anywhere in the bundle, so a leak will
+   bounce back to you.)
+   EXCEPTION for incident-derived content (e.g. a **Case**, per this KB's
+   CONVENTIONS): the canonical source IS the production incident itself — the
+   failing job (`uploadJob <id>`) and/or its Sentry issue/permalink — so those ARE
+   valid in `source`. The `feature/<id>` branch remains forbidden.
 5. WHEN UNSURE: do not resolve silently. Make only the safe change, mark the
    uncertain part `UNRESOLVED: ...` in the concept, and flag it in your PR
    description for the human.

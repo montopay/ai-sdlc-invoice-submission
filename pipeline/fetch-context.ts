@@ -112,7 +112,30 @@ export type JobContext = {
   fetchedAtIso: string;
   mongo: CuratedJob | null;
   sentry: SentryContext[];
+  artifacts?: DownloadedArtifact[];
 };
+
+// A failure artifact the scraper attached to the job's Sentry event (base-scraper
+// captureExceptionWithScope adds "screenshot.png" + "page.html"). Downloaded locally so
+// the investigate stage can open the PNG or Grep/Read the DOM snapshot.
+export type DownloadedArtifact = {
+  eventId: string;
+  name: string; // Sentry attachment filename, e.g. "screenshot.png" or "page.html"
+  localPath?: string; // relative to context/<id>/, when the download succeeded
+  error?: string; // set instead of localPath when the download failed (best-effort)
+};
+
+// One attachment listed on a Sentry event.
+export type SentryAttachment = {
+  eventId: string;
+  attachmentId: string;
+  name: string;
+  mimetype?: string;
+  size?: number;
+};
+
+// Downloads raw bytes from a Sentry API path (an attachment ?download). Injected in tests.
+export type SentryBinaryGet = (path: string) => Promise<Uint8Array>;
 
 // A minimal HTTP GET returning parsed JSON, keyed by API path. Injected in tests.
 export type HttpGet = (path: string) => Promise<any>;
@@ -407,11 +430,175 @@ export function makeMongoFind(uri: string): MongoFind {
   };
 }
 
+// Mirrors the Ariba scraper's UPLOAD_JOBS_AGGREGATION_PIPELINE (src/constants.ts):
+// joins upload_jobs -> upload_invoice_schemas to assemble the FULL engine input. The
+// `reproduce` step runs this from the pipeline (which owns the Mongo connection) and
+// hands the scraper a complete, self-contained input, so the scraper never
+// re-hydrates and needs no MongoDB of its own. Keep in sync with the scraper.
+const REPRODUCE_INPUT_PIPELINE: any[] = [
+  {
+    $project: {
+      _id: 0,
+      engine: "uploadInvoice",
+      portalName: "$portalUser.portal_name",
+      uploadJob: { _id: "$_id" },
+      portalUser: {
+        _id: "$portalUser._id",
+        name: "$portalUser.customer_name",
+        rootUrl: "https://service.ariba.com",
+        username: "$portalUser.username",
+        password: "",
+        totpUri: "$portalUser.totp_uri",
+      },
+      buyer: { _id: "$buyer._id", name: "$buyer.buyer_name" },
+      purchaseOrder: {
+        $cond: {
+          if: {
+            $and: [
+              { $eq: [{ $type: "$jobPayload.contractInvoice" }, "object"] },
+              { $gt: [{ $size: { $objectToArray: "$jobPayload.contractInvoice" } }, 0] },
+            ],
+          },
+          then: "$$REMOVE",
+          else: {
+            _id: { $toString: "$portalPo._id" },
+            portal_id: "$portalPo.id_on_portal",
+            number: "$portalPo.po_number",
+          },
+        },
+      },
+      invoiceFormValues: "$jobPayload",
+    },
+  },
+  { $lookup: { from: "upload_invoice_schemas", localField: "buyer._id", foreignField: "buyerId", as: "invoiceFormSchema" } },
+  {
+    $addFields: {
+      "uploadJob._id": { $toString: "$uploadJob._id" },
+      "portalUser._id": { $toString: "$portalUser._id" },
+      "buyer._id": { $toString: "$buyer._id" },
+      invoiceFormSchema: { $arrayElemAt: ["$invoiceFormSchema", 0] },
+    },
+  },
+  { $addFields: { invoiceFormSchema: "$invoiceFormSchema.schema" } },
+];
+
+// Build the full self-contained scraper input for one job (or null if not found).
+export async function buildReproduceInput(
+  uri: string,
+  database: string,
+  collection: string,
+  jobId: string,
+): Promise<any | null> {
+  const { MongoClient, ObjectId } = await import("mongodb");
+  const client = new MongoClient(uri);
+  try {
+    await client.connect();
+    const docs = await client
+      .db(database)
+      .collection(collection)
+      .aggregate([{ $match: { _id: new ObjectId(jobId) } }, ...REPRODUCE_INPUT_PIPELINE])
+      .toArray();
+    return docs[0] ?? null;
+  } finally {
+    await client.close();
+  }
+}
+
 function requireEnv(value: string | undefined, name: string): string {
   if (!value) {
     throw new Error(`${name} is required for the fetch (set it in this repo's .env; see .env.example).`);
   }
   return value;
+}
+
+// -------------------------------------------------------------------------
+// Sentry failure-artifact download (screenshot + page.html DOM snapshot on the event)
+// -------------------------------------------------------------------------
+// The scraper attaches "screenshot.png" AND "page.html" to the Sentry event on error
+// (base-scraper captureExceptionWithScope). We fetch both with the SAME
+// SENTRY_AUTH_TOKEN used for the events — no S3, no extra credentials.
+export function makeSentryBinaryGet(regionUrl: string, authToken: string): SentryBinaryGet {
+  const base = regionUrl.replace(/\/+$/, "");
+  return async (path: string) => {
+    const res = await fetch(base + path, { headers: { Authorization: `Bearer ${authToken}` } });
+    if (!res.ok) throw new Error(`Sentry ${res.status} for ${path}`);
+    return new Uint8Array(await res.arrayBuffer());
+  };
+}
+
+// List the attachments on one event. Best-effort: returns [] on any failure.
+export async function listEventAttachments(
+  get: HttpGet,
+  org: string,
+  project: string,
+  eventId: string,
+): Promise<SentryAttachment[]> {
+  try {
+    const raw = await get(`/api/0/projects/${org}/${project}/events/${eventId}/attachments/`);
+    if (!Array.isArray(raw)) return [];
+    return raw.map((a: any) => ({
+      eventId,
+      attachmentId: String(a.id),
+      name: String(a.name ?? ""),
+      mimetype: a.mimetype,
+      size: a.size,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+// Download the failure artifacts the scraper attached to the job's Sentry events —
+// the error "screenshot.png" AND the "page.html" DOM snapshot (base-scraper's
+// captureExceptionWithScope attaches both, sentry.ts) — into <jobDir>/artifacts/. The
+// HTML is the richer signal for selector/DOM bugs: it's the exact markup at failure
+// time, which the investigate stage can Grep/Read. Best-effort: never throws;
+// de-duplicates by attachment id and caps how many are pulled. Returns what to attach
+// to JobContext.artifacts.
+export async function downloadJobArtifacts(
+  ctx: JobContext,
+  cfg: FetchConfig,
+  deps: { jsonGet: HttpGet; binGet: SentryBinaryGet },
+  jobDir: string,
+  max = 10,
+): Promise<DownloadedArtifact[]> {
+  const org = cfg.sentry.org;
+  const events: Array<{ project: string; eventId: string }> = [];
+  const seenEv = new Set<string>();
+  for (const s of ctx.sentry) {
+    for (const ev of s.events) {
+      if (ev.id && !seenEv.has(ev.id)) {
+        seenEv.add(ev.id);
+        events.push({ project: s.project, eventId: ev.id });
+      }
+    }
+  }
+  const out: DownloadedArtifact[] = [];
+  const seenAtt = new Set<string>();
+  // Want the DOM snapshot + the screenshot. page.html is served as text/plain, so match
+  // HTML by filename; images by filename or mimetype.
+  const wanted = (a: SentryAttachment) =>
+    /\.html?$/i.test(a.name) || /\.png$/i.test(a.name) || (a.mimetype ?? "").startsWith("image/");
+  for (const { project, eventId } of events) {
+    if (out.length >= max) break;
+    const atts = await listEventAttachments(deps.jsonGet, org, project, eventId);
+    for (const a of atts.filter(wanted)) {
+      if (out.length >= max || seenAtt.has(a.attachmentId)) continue;
+      seenAtt.add(a.attachmentId);
+      mkdirSync(`${jobDir}/artifacts`, { recursive: true });
+      const rel = `artifacts/${eventId}-${a.name || "attachment"}`;
+      try {
+        const bytes = await deps.binGet(
+          `/api/0/projects/${org}/${project}/events/${eventId}/attachments/${a.attachmentId}/?download=1`,
+        );
+        writeFileSync(`${jobDir}/${rel}`, Buffer.from(bytes));
+        out.push({ eventId, name: a.name, localPath: rel });
+      } catch (err) {
+        out.push({ eventId, name: a.name, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+  return out;
 }
 
 // -------------------------------------------------------------------------
@@ -475,6 +662,20 @@ export function renderContextMarkdown(ctx: JobContext): string {
       for (const r of m.aiResult.uploadInvoiceResults ?? []) {
         L.push(`  - invoice ${r.invoiceId ?? "?"}: ${r.status ?? "?"}${r.errorMessage ? ` — ${r.errorMessage}` : ""}`);
       }
+    }
+  }
+
+  // Failure artifacts: the screenshot(s) + page.html DOM snapshot(s) attached to the
+  // job's Sentry events, downloaded into artifacts/ so the investigate agent can open
+  // the PNG or Grep/Read the HTML.
+  const arts = ctx.artifacts ?? [];
+  if (arts.length) {
+    L.push("");
+    L.push("## Failure artifacts (from Sentry)");
+    L.push("");
+    for (const a of arts) {
+      if (a.localPath) L.push(`- **${a.name}** — \`${a.localPath}\` (event ${a.eventId})`);
+      else L.push(`- **${a.name}** — download failed${a.error ? ` (${a.error})` : ""} (event ${a.eventId})`);
     }
   }
 

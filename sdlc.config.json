@@ -1,27 +1,29 @@
 {
-  "_comment": "Autonomy dial per stage. mode is one of: 'approve' (agent produces its artifact, pipeline pauses for your y/n before saving; on reject it re-runs with your feedback), 'auto' (agent runs, pipeline continues without asking), or 'manual' (you do the stage yourself). mode governs the human pause for the text-producing stages (parse, spec, review). The gated stages run a deterministic orchestrator-side check regardless of mode: implement is gated by the product's syntax check, and qa by the full E2E suite + acceptance-criteria (AC-N) coverage. So qa is effectively a hard gate that mode cannot disable — 'auto' there only means 'do not pause for a human before the gate runs'. Deploy (not yet a stage) will likewise be a hard, non-configurable gate.",
-  "_comment_enabled": "Each stage also takes an 'enabled' flag (defaults to true when omitted). Set 'enabled': false to skip that stage entirely — no agent runs, no gate runs, and the dashboard shows the stage as 'skipped'. Skipping is literal, not smart: if you disable a stage whose artifact a later stage consumes (e.g. spec, which implement/review/test/qa all read via specs/<id>.md), that later stage fails when the artifact is missing. Disabling qa removes the authoritative ship gate — the pipeline will finish at the last enabled stage with nothing verifying acceptance criteria.",
+  "_comment": "Autonomy dial per stage. mode is one of: 'approve' (agent produces its artifact, pipeline pauses for your y/n before saving; on reject it re-runs with your feedback), 'auto' (agent runs, pipeline continues without asking), or 'manual' (currently behaves like auto). mode governs the human pause for the text-producing stages (investigate, spec, review). The gated stages run a deterministic orchestrator-side check regardless of mode: implement is gated by the product's syntax check; qa (when enabled) by the full E2E suite + acceptance-criteria (AC-N) coverage. For the scraper-debugging use case test and qa are disabled and deploy is not a stage — the pipeline ends after review with a proposed fix on feature/<jobId> for a human to run/verify.",
+  "_comment_enabled": "Each stage also takes an 'enabled' flag (defaults to true when omitted). Set 'enabled': false to skip that stage entirely — no agent runs, no gate runs, and the dashboard shows the stage as 'skipped'. Skipping is literal: if you disable a stage whose artifact a later stage consumes (e.g. spec, which implement/review read via specs/<id>.md), that later stage fails when the artifact is missing.",
   "project": {
-    "productPath": "../Homebase",
-    "knowledgePath": "../OKF"
+    "productPath": "../Scrapers/ariba-scraper-main",
+    "knowledgePath": "../Scrapers/scraper-knowledge-base/wiki"
   },
   "stages": {
-    "parse":     { "enabled": true, "mode": "approve" },
-    "spec":      { "enabled": true, "mode": "approve" },
-    "implement": { "enabled": true, "mode": "auto", "maxTurns": 30 },
-    "review":    { "enabled": true, "mode": "auto" },
-    "test":      { "enabled": false, "mode": "auto" },
-    "qa":        { "enabled": true, "mode": "auto" }
+    "reproduce":   { "enabled": true,  "mode": "approve" },
+    "investigate": { "enabled": true,  "mode": "approve" },
+    "spec":        { "enabled": true,  "mode": "approve" },
+    "implement":   { "enabled": true,  "mode": "auto", "maxTurns": 30 },
+    "review":      { "enabled": true,  "mode": "auto" },
+    "test":        { "enabled": false, "mode": "auto" },
+    "qa":          { "enabled": false, "mode": "auto" }
   },
   "learning": { "enabled": true },
   "_comment_mcp": "Optional MCP wiring. 'configPath' points at an MCP-format file in THIS repo (default 'mcp.json') whose ${ENV} placeholders resolve from a gitignored .env (copy .env.example). 'stages' maps a stage to the MCP tool patterns it may call — a stage not listed gets no MCP, so removing this block restores the no-MCP behavior. Servers load with --strict-mcp-config (reproducible; ignores desktop/user/claude.ai connectors). Missing ${ENV} credentials fail fast at startup.",
   "mcp": {
     "configPath": "mcp.json",
     "stages": {
+      "investigate": ["mcp__MongoDB__*"],
       "spec": ["mcp__MongoDB__*"]
     }
   },
-  "_comment_fetch": "Optional pre-fetch of external debugging context for the `npm run sdlc fetch <uploadJobId>` command. Deterministic (not agent/MCP-driven): pulls the upload job's MongoDB document and its matching Sentry events into context/<id>/context.{md,json}. Requires SENTRY_AUTH_TOKEN (Sentry User Auth Token / Internal Integration with scopes event:read, project:read, org:read) and MONGODB_URI in this repo's .env (see .env.example). sentry.queryTemplate substitutes {id} with the job id — confirmed live to be the Sentry tag 'uploadJobId:{id}' on upload-invoice events. sentry.statsPeriod for the issues endpoint accepts ONLY '', '24h', or '14d' (a Sentry API limitation — '90d' returns HTTP 400). Remove this block to disable the command.",
+  "_comment_fetch": "Deterministic pre-fetch for `npm run sdlc fetch <uploadJobId>` (and the fetch phase of `debug`). Pulls the upload job's MongoDB document and its matching Sentry events into context/<id>/context.{md,json}. When S3 read creds (S3_REGION/S3_ENDPOINT/S3_ACCESS_KEY_ID/S3_SECRET_ACCESS) are present in .env, it ALSO downloads the job's prod failure artifacts (error screenshot + recording) referenced in the Mongo doc into context/<id>/artifacts/. Requires SENTRY_AUTH_TOKEN and MONGODB_URI in .env. sentry.statsPeriod accepts ONLY '', '24h', or '14d' (a Sentry API limitation — '90d' returns HTTP 400).",
   "fetch": {
     "sentry": {
       "org": "monto-e1c13a9a2",
@@ -33,5 +35,12 @@
       "maxEventsPerIssue": 5
     },
     "mongo": { "database": "MontoProd", "collection": "upload_jobs" }
+  },
+  "_comment_reproduce": "Runs as an approve-gated `reproduce` STAGE before investigate (offered every run — decline with n to skip; a decline or failed run never blocks the pipeline), capturing the result to context/<id>/reproduce.md which investigate then reads. Also available standalone via `npm run sdlc reproduce <uploadJobId>`. Runs the real scraper HEADED to diagnose or validate a fix. runReproduceCommand builds a SELF-CONTAINED input from the Mongo step (the upload_jobs aggregation) — omitting uploadJob._id so the scraper does NOT re-hydrate — prompts for the portal password (never stored/logged; injected into the input), and sets invoiceFormValues.directInvoiceSubmission=false so a live invoice is NEVER filed (a draft may still be created). NO-MONGO takes THREE cooperating settings: (1) doReproduce strips MONGODB_URI/CACHE_MONGODB_URI from the child env so the scraper's constants.ts leaves its URI undefined and the session cache (session-cache.cache) is null (no unauthorized upsert); (2) SKIP_MONGO=true stops the scraper's own constants.ts from falling back to the SSM mongo_uri param; (3) NODE_ENV=test makes @montopay/base-scraper's base_constants.ts getMongodbUri() return '' instead of hitting SSM (it does NOT honor SKIP_MONGO, so with MONGODB_URI stripped it would otherwise ParameterNotFound-crash at import, before the browser launches). HEADED=true forces a visible browser regardless of NODE_ENV (engine spreads headless:false last). No S3/AWS is touched: setupRecorder/uploadErrorScreenshot early-return because uploadJob (hence uploadJobId) is deleted. See PLAN.md step 7.",
+  "reproduce": {
+    "command": "npm start",
+    "cwd": "../Scrapers/ariba-scraper-main",
+    "env": { "NODE_ENV": "test", "HEADED": "true", "SKIP_MONGO": "true" },
+    "passwordPrompt": "Enter Ariba portal password (for local reproduction only)"
   }
 }

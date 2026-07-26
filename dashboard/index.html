@@ -52,11 +52,31 @@ function esc(s) {
 function basename(p) {
   return String(p || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop() || '—';
 }
+// Job ids are either short pipeline ticket numbers (e.g. 002) or 24-char Mongo
+// ObjectIds. The narrow ID columns are sized for the former; clip the latter to a
+// short prefix (full id stays in the title tooltip + the detail view) so it can't
+// overflow its cell and overlap the title next to it.
+function shortId(id) { id = String(id ?? ''); return id.length > 12 ? id.slice(0, 8) + '…' : id; }
+// A human title for a job that has no ticket .md yet: the fetched context's
+// portal + top Sentry error (what's actually being debugged), so the Title
+// column carries real info instead of duplicating the id as "Job <id>".
+function contextTitle(ctx) {
+  if (!ctx) return '';
+  const m = ctx.mongo || {};
+  const err = (ctx.sentry || []).flatMap(s => (s.events || []).map(e => e && e.title)).find(Boolean);
+  const portal = m.portalName || '';
+  let t = '';
+  if (portal && err) t = portal + ' · ' + err;
+  else if (err) t = err;
+  else if (portal && m.customerName) t = portal + ' — ' + m.customerName;
+  else t = portal || m.customerName || '';
+  return t.length > 80 ? t.slice(0, 79) + '…' : t;
+}
 
 const statusMeta = s => ({
   running: { label: 'Running',                color: COLORS.running },
   waiting: { label: 'Waiting approval',       color: COLORS.waiting },
-  done:    { label: 'Done · QA passed',       color: COLORS.done },
+  done:    { label: 'Done · fix reviewed',    color: COLORS.done },
   blocked: { label: 'Blocked · needs human',  color: COLORS.blocked },
 }[s] || { label: 'In progress', color: '#8b98a5' });
 
@@ -123,9 +143,22 @@ function parseMd(src) {
       out.push(`<pre style="margin:8px 0 14px;padding:12px 14px;background:#0c1016;border:1px solid #1c232c;border-radius:8px;overflow:auto"><code style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#a7d9c9;line-height:1.55">${esc(code.join('\n'))}</code></pre>`);
       continue;
     }
-    if (/^### /.test(line)) { out.push(`<h4 style="margin:18px 0 6px;font-size:13px;font-weight:600;color:#dbe4ec;letter-spacing:.2px">${mdInline(line.slice(4))}</h4>`); i++; continue; }
-    if (/^## /.test(line))  { out.push(`<h3 style="margin:20px 0 8px;font-size:15px;font-weight:600;color:#e6edf3">${mdInline(line.slice(3))}</h3>`); i++; continue; }
-    if (/^# /.test(line))   { out.push(`<h2 style="margin:2px 0 10px;font-size:17px;font-weight:700;color:#f0f5fa;line-height:1.3">${mdInline(line.slice(2))}</h2>`); i++; continue; }
+    // Headings #..###### — renderContextMarkdown emits #### per Sentry event
+    // title, so >3 hashes MUST be handled; an unhandled #### used to fall to the
+    // paragraph branch and hang the tab (see the always-advance guard below).
+    // Levels 1-3 keep the original styling; 4-6 render as a compact h4. A bare
+    // "#text" with no space is not a heading and correctly falls through.
+    {
+      const hm = /^(#{1,6}) +(.+)$/.exec(line);
+      if (hm) {
+        const [tag, css] = ({
+          1: ['h2', 'margin:2px 0 10px;font-size:17px;font-weight:700;color:#f0f5fa;line-height:1.3'],
+          2: ['h3', 'margin:20px 0 8px;font-size:15px;font-weight:600;color:#e6edf3'],
+          3: ['h4', 'margin:18px 0 6px;font-size:13px;font-weight:600;color:#dbe4ec;letter-spacing:.2px'],
+        })[hm[1].length] || ['h4', 'margin:14px 0 5px;font-size:12.5px;font-weight:600;color:#c4cdd6;letter-spacing:.2px'];
+        out.push(`<${tag} style="${css}">${mdInline(hm[2])}</${tag}>`); i++; continue;
+      }
+    }
     if (/^---+$/.test(line.trim())) { out.push(`<hr style="border:none;border-top:1px solid #1c232c;margin:16px 0">`); i++; continue; }
 
     if (/^\|/.test(line)) {
@@ -147,8 +180,10 @@ function parseMd(src) {
       out.push(`<ul style="margin:4px 0 12px;padding-left:20px;color:#c2cdd7">${items.map(it => `<li style="margin:4px 0">${mdInline(it)}</li>`).join('')}</ul>`);
       continue;
     }
-    // paragraph
-    const para = []; while (i < lines.length && lines[i].trim() && !/^(#|\||```|\s*[-*] |---)/.test(lines[i])) { para.push(lines[i]); i++; }
+    // paragraph — consume >=1 line up front so i ALWAYS advances; an unhandled
+    // prefix (e.g. a heading level we don't special-case) can never infinite-loop.
+    const para = [lines[i++]];
+    while (i < lines.length && lines[i].trim() && !/^(#|\||```|\s*[-*] |---)/.test(lines[i])) { para.push(lines[i]); i++; }
     out.push(`<p style="margin:6px 0 10px;color:#b8c3cd">${mdInline(para.join(' '))}</p>`);
   }
   return out.join('');
@@ -157,11 +192,19 @@ function parseMd(src) {
 // ============================================================================
 //  STATE + DATA
 // ============================================================================
-const state = { view: 'overview', heroId: null, detailId: null, artifactTab: {} };
+const state = {
+  view: 'overview', heroId: null, detailId: null, artifactTab: {}, shotsOpen: {},
+  // control-plane UI state (all survive the 1.5s morph repaint because they live
+  // in state, not the DOM): the header "Debug a job" box, and per-pause approval.
+  debugJobId: '', debugMsg: '', debugOpen: false,   // the "Debug a job" modal
+  feedbackDraft: {},   // "<ticket>__<stage>" -> reject feedback text (bound via input listener)
+  rejectOpen: {},      // "<ticket>__<stage>" -> whether the reject textarea is revealed
+  decision: {},        // "<ticket>__<stage>" -> { busy:boolean, msg:string } optimistic submit state
+};
 
 let model = {
   now: Date.now(), tickets: [],
-  topStats: { running: 0, waiting: 0, blocked: 0, done: 0, qaRate: 0 },
+  topStats: { running: 0, waiting: 0, blocked: 0, done: 0, cases: 0 },
   activity: [], gateResults: [],
   obs: { tiles: [], stageAgg: [], beltHot: [] },
 };
@@ -169,29 +212,53 @@ let productName = '—';
 
 let config = null, configFetched = false;
 const titleCache = new Map();      // id -> { title, branch }
-const artifactCache = new Map();   // "dir/id" -> { status:'ok'|'missing', body }
+const artifactCache = new Map();   // "tabKey/id" -> { status:'ok'|'missing', body }
+const contextCache = new Map();    // id -> parsed context.json | null (fetched, absent)
 const prefetched = new Set();      // ids we've kicked a full artifact prefetch for
+const requestCache = new Map();    // promptId -> approvals/<t>__<s>.request.json (control plane)
+const previewCache = new Map();    // promptId -> the pause's produced-output preview text
 
-const DIRS = ['tickets', 'specs', 'reviews', 'qa', 'retros', 'curator'];
+// Each artifact tab builds its own URL — most are /data/<dir>/<id>.md, but the
+// fetched debug context lives in a per-job subfolder (context/<id>/...).
 const TABS = [
-  ['ticket',  'Ticket',    'tickets'],
-  ['spec',    'Spec',      'specs'],
-  ['review',  'Review',    'reviews'],
-  ['qa',      'QA Report', 'qa'],
-  ['retro',   'Retro',     'retros'],
-  ['curator', 'Curator',   'curator'],
+  { key: 'investigate', label: 'Investigation', path: id => `/data/tickets/${id}.md` },
+  { key: 'context',     label: 'Context',       path: id => `/data/context/${id}/context.md` },
+  { key: 'reproduce',   label: 'Reproduce',     path: id => `/data/context/${id}/reproduce.md` },
+  { key: 'spec',        label: 'Spec',          path: id => `/data/specs/${id}.md` },
+  { key: 'review',      label: 'Review',        path: id => `/data/reviews/${id}.md` },
+  { key: 'retro',       label: 'Retro',         path: id => `/data/retros/${id}.md` },
+  { key: 'case',        label: 'Case',          path: id => `/data/curator/${id}.md` },
 ];
+const DEFAULT_TAB_ORDER = ['review', 'spec', 'investigate', 'reproduce', 'context', 'case', 'retro'];
 const MISS_NOTE = {
-  ticket: 'No ticket file found for this id.',
-  spec:   'The Spec stage has not produced output yet.',
-  review: 'The Review stage has not produced output yet.',
-  qa:     'The QA gate has not run yet — earlier stages may still be in progress or awaiting approval.',
-  retro:  'No retrospective has been written for this ticket yet.',
-  curator: 'The Curator has not run for this ticket yet — it runs after a ticket ships, when learning is enabled.',
+  investigate: 'No investigation yet — run `fetch` then the investigate stage.',
+  context: 'No fetched context — run `npm run sdlc fetch <jobId>` (or `debug`).',
+  reproduce: 'No reproduction captured — the reproduce stage was declined, or has not run.',
+  spec:   'The spec stage has not produced output yet.',
+  review: 'The review stage has not produced output yet.',
+  retro:  'No retrospective has been written for this job yet.',
+  case:   'The curator has not proposed a Case yet — it runs after review, when learning is enabled.',
 };
+// Which artifact tab hosts the in-tab Approve/Reject for a paused stage. Keys are
+// TABS keys; values are STAGES keys (identity for these — the tab and the stage
+// share a name). Stages not here (implement/qa/context/retro/case) never pause here.
+const TAB_STAGE = { investigate: 'investigate', spec: 'spec', review: 'review', reproduce: 'reproduce', test: 'test' };
 
 async function fetchText(url) { try { const r = await fetch(url); return r.ok ? await r.text() : ''; } catch { return ''; } }
 async function fetchJson(url) { try { const r = await fetch(url); return r.ok ? await r.json() : null; } catch { return null; } }
+// The ONE write path to the pipeline: POST /command (start a run, or approve/reject
+// a paused stage). The x-sdlc-dashboard header + same-origin localhost gate the
+// server enforces; here we just send JSON and hand back {status, json}.
+async function postCommand(bodyObj) {
+  try {
+    const res = await fetch('/command', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-sdlc-dashboard': '1' },
+      body: JSON.stringify(bodyObj),
+    });
+    return { status: res.status, json: await res.json().catch(() => null) };
+  } catch { return { status: 0, json: null }; }
+}
 
 function stripNum(s) { return s.replace(/^\d+\s*[·:]\s*/, ''); }
 function extractTitle(md, id) {
@@ -201,54 +268,102 @@ function extractTitle(md, id) {
     const first = md.split('\n').map(l => l.trim()).find(Boolean);
     if (first) return stripNum(first);
   }
-  return 'Ticket ' + id;
+  return 'Job ' + id;
 }
 
-async function fetchArtifact(dir, id) {
+async function fetchArtifact(tab, id) {
   try {
-    const r = await fetch('/data/' + dir + '/' + id + '.md');
+    const r = await fetch(tab.path(id));
     return r.ok ? { status: 'ok', body: await r.text() } : { status: 'missing' };
   } catch { return { status: 'missing' }; }
 }
-async function loadArtifact(dir, id) {
-  const key = dir + '/' + id;
+async function loadArtifact(tab, id) {
+  const key = tab.key + '/' + id;
   if (artifactCache.has(key)) return artifactCache.get(key);
-  const rec = await fetchArtifact(dir, id);
+  const rec = await fetchArtifact(tab, id);
   artifactCache.set(key, rec);
   return rec;
+}
+// The fetched context.json is structured (Mongo + Sentry + downloaded artifact
+// paths) — the Debug-context panel uses it to render the screenshot + a summary.
+async function loadContext(id) {
+  if (contextCache.has(id)) return contextCache.get(id);
+  const json = await fetchJson('/data/context/' + id + '/context.json');
+  contextCache.set(id, json); // null when absent
+  return json;
+}
+// A paused stage's request.json carries { question, previewPath, promptId, … }.
+// Cached per promptId (a new pause mints a new promptId, so this never goes stale);
+// a transient null/absent is NOT cached, so we keep retrying until it lands.
+async function loadRequest(id, stage, promptId) {
+  if (requestCache.has(promptId)) return requestCache.get(promptId);
+  try {
+    const r = await fetch('/data/approvals/' + id + '__' + stage + '.request.json');
+    // A 404 means the request file is GONE — the pause was already settled and
+    // cleaned up (or the run died). request.json is always written BEFORE the
+    // awaiting_approval event, so a 404 for a "waiting" stage reliably means
+    // "resolved". Cache null so we stop retrying and the UI suppresses the now-
+    // defunct Approve/Reject controls instead of showing "loading…" forever.
+    if (r.status === 404) { requestCache.set(promptId, null); return null; }
+    if (!r.ok) return undefined;            // transient — retry next poll, don't cache
+    const json = await r.json();
+    requestCache.set(promptId, json);
+    return json;
+  } catch { return undefined; }             // transient
+}
+// The produced-output preview for a pause, at the repo-root-relative previewPath
+// from its request.json (served under /data/). Cached per promptId; empty not cached.
+async function loadPreview(promptId, previewPath) {
+  if (previewCache.has(promptId)) return previewCache.get(promptId);
+  const body = await fetchText('/data/' + previewPath);
+  if (body) previewCache.set(promptId, body);
+  return body;
 }
 async function prefetchAll(id) {
   if (prefetched.has(id)) return;
   prefetched.add(id);
-  await Promise.all(DIRS.map(d => loadArtifact(d, id)));
+  await Promise.all([...TABS.map(t => loadArtifact(t, id)), loadContext(id)]);
   rerender();
 }
-// The cache above is write-once — right for a finished ticket, but it froze the
-// Ticket/Spec/Review/QA/Retro tabs at whatever existed when the detail view
-// first opened, so a stage that finished mid-run only appeared after a reload.
-// This RE-fetches the currently open ticket's artifacts (5 tiny localhost reads)
-// each poll, so each file shows up as its agent writes it. Returns true only
-// when something actually changed, so the caller repaints solely on real updates.
+// The cache above is write-once — right for a finished job, but it froze the tabs
+// at whatever existed when the detail view first opened. This RE-fetches the open
+// job's artifacts each poll, so each file shows up as its agent writes it. Returns
+// true only when something actually changed, so the caller repaints on real updates.
 async function refreshOpenArtifacts(id) {
   if (!id) return false;
   let changed = false;
-  await Promise.all(DIRS.map(async d => {
-    const rec = await fetchArtifact(d, id);
-    const key = d + '/' + id;
+  await Promise.all(TABS.map(async t => {
+    const rec = await fetchArtifact(t, id);
+    const key = t.key + '/' + id;
     const prev = artifactCache.get(key);
     if (!prev || prev.status !== rec.status || prev.body !== rec.body) {
       artifactCache.set(key, rec);
       changed = true;
     }
   }));
+  // context.json can appear mid-run (after fetch). Re-fetch while we don't have it.
+  if (!contextCache.get(id)) {
+    const json = await fetchJson('/data/context/' + id + '/context.json');
+    if (json) { contextCache.set(id, json); changed = true; }
+  }
   return changed;
 }
 function defaultTab(id) {
-  for (const [tab, , dir] of [['qa', 0, 'qa'], ['review', 0, 'reviews'], ['spec', 0, 'specs'], ['ticket', 0, 'tickets'], ['retro', 0, 'retros'], ['curator', 0, 'curator']]) {
-    const rec = artifactCache.get(dir + '/' + id);
-    if (rec && rec.status === 'ok') return tab;
+  // A stage waiting on YOUR approval wins — open straight onto its tab so the
+  // Approve/Reject controls are visible without hunting for them.
+  const t = model.tickets.find(x => x.id === id);
+  if (t) {
+    for (const key of DEFAULT_TAB_ORDER) {
+      const stage = TAB_STAGE[key];
+      const s = stage && t.stages[stage];
+      if (s && s.state === 'waiting' && s.promptId) return key;
+    }
   }
-  return 'ticket';
+  for (const key of DEFAULT_TAB_ORDER) {
+    const rec = artifactCache.get(key + '/' + id);
+    if (rec && rec.status === 'ok') return key;
+  }
+  return 'investigate';
 }
 
 // ---------- the poll ----------
@@ -274,13 +389,20 @@ async function refresh() {
   await Promise.all(ids.map(async id => {
     if (!titleCache.has(id)) {
       const md = await fetchText('/data/tickets/' + id + '.md');
-      const title = extractTitle(md, id);
+      // A ticket .md heading is the best title; store '' when there's none so we
+      // fall back to a context-derived title (below) rather than "Job <id>".
+      const t = md.trim() ? extractTitle(md, id) : '';
+      const mdTitle = (t && t !== 'Job ' + id) ? t : '';
       const implEnt = runlog.find(e => String(e.ticket) === id && e.stage === 'implement' && e.branch);
       const branch = (implEnt && implEnt.branch) || ('feature/' + id);
-      titleCache.set(id, { title, branch });
+      titleCache.set(id, { mdTitle, branch });
     }
-    const t = titleCache.get(id);
-    meta[id] = { title: t.title, branch: t.branch, config };
+    const cached = titleCache.get(id);
+    // Ensure context.json is loaded (cached) so a job with no ticket .md still
+    // gets a real title from its portal + Sentry error, not "Job <id>".
+    const ctx = await loadContext(id);
+    const title = cached.mdTitle || contextTitle(ctx) || ('Job ' + id);
+    meta[id] = { title, branch: cached.branch, config };
   }));
 
   model = deriveModel({ runlog, events, meta, now: Date.now() });
@@ -312,7 +434,7 @@ function buildShell() {
         <div style="width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#22d3ee,#4f9dff);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#06121a">S</div>
         <div style="display:flex;flex-direction:column;line-height:1.1">
           <span style="font-weight:600;font-size:14px;letter-spacing:.2px">SDLC Pipeline</span>
-          <span style="font-size:10.5px;color:#5c6773;letter-spacing:.3px">multi-agent orchestrator</span>
+          <span style="font-size:10.5px;color:#5c6773;letter-spacing:.3px">invoice-upload scraper debugging</span>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid #1c232c;border-radius:8px;background:#0b0f15">
@@ -323,6 +445,10 @@ function buildShell() {
       <div id="topstats" style="display:flex;align-items:stretch;gap:8px;margin-left:4px"></div>
       <div style="flex:1"></div>
       <div style="display:flex;align-items:center;gap:8px">
+        <button data-act="debug-open" style="display:flex;align-items:center;gap:6px;padding:6px 13px;background:#0c1826;border:1px solid #1c2e44;border-radius:8px;color:#4f9dff;font-size:12.5px;font-weight:500;cursor:pointer;white-space:nowrap"><span style="font-size:14px;line-height:1">+</span> Debug a job</button>
+        <button id="abortBtn" data-act="abort" title="Force-stop the running pipeline (and its headed browser)" style="display:none;align-items:center;gap:6px;padding:6px 12px;background:#2a1416;border:1px solid #5a2a2e;border-radius:8px;color:#fb7185;font-size:12.5px;font-weight:500;cursor:pointer;white-space:nowrap"><span style="font-size:11px;line-height:1">◼</span> Abort run</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
         <span style="font-size:11px;color:#5c6773">Product</span>
         <div id="product" style="display:flex;align-items:center;gap:7px;padding:5px 11px;background:#0b0f15;border:1px solid #1c232c;border-radius:8px"></div>
       </div>
@@ -332,9 +458,79 @@ function buildShell() {
       <nav id="nav" style="flex:0 0 210px;display:flex;flex-direction:column;background:#0e1218;border-right:1px solid #1c232c;padding:14px 10px;gap:3px"></nav>
       <main id="main" style="flex:1;min-width:0;overflow:auto;position:relative"></main>
     </div>
+    <div id="debugModal" style="display:none;position:fixed;inset:0;z-index:100;background:rgba(6,9,13,.62);align-items:flex-start;justify-content:center">
+      <div data-act="debug-close" style="position:absolute;inset:0"></div>
+      <div style="position:relative;margin-top:12vh;width:440px;max-width:calc(100vw - 32px);background:#0e1218;border:1px solid #1c232c;border-radius:14px;padding:22px 22px 18px;box-shadow:0 20px 60px rgba(0,0,0,.55);animation:sdlcFade .18s ease">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+          <h2 style="margin:0;font-size:16px;font-weight:600;color:#f0f5fa">Debug a job</h2>
+          <button data-act="debug-close" style="background:none;border:none;color:#5c6773;font-size:20px;line-height:1;cursor:pointer;padding:0 4px">×</button>
+        </div>
+        <div style="font-size:12px;color:#8b98a5;margin-bottom:14px;line-height:1.5">Starts the pipeline for an upload job — like <span style="font-family:'IBM Plex Mono',monospace;color:#c9d4de">npm run sdlc debug &lt;id&gt;</span>. Opens a console window with the headed browser.</div>
+        <input id="debugInput" type="text" placeholder="upload job id (24-hex)" spellcheck="false" autocomplete="off" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#0b0f15;border:1px solid #1c232c;border-radius:9px;color:#e6edf3;font-family:'IBM Plex Mono',monospace;font-size:13px;outline:none">
+        <div id="debugMsg" style="min-height:15px;margin-top:9px;font-size:11.5px;color:#f5b83d"></div>
+        <div style="display:flex;justify-content:flex-end;gap:9px;margin-top:8px">
+          <button data-act="debug-close" style="padding:8px 15px;background:transparent;border:1px solid #1c232c;border-radius:9px;color:#8b98a5;font-size:12.5px;cursor:pointer">Cancel</button>
+          <button data-act="debug-start" style="padding:8px 16px;background:#0c1826;border:1px solid #1c2e44;border-radius:9px;color:#4f9dff;font-size:12.5px;font-weight:600;cursor:pointer">Start run</button>
+        </div>
+      </div>
+    </div>
   </div>`;
   document.getElementById('app').addEventListener('click', onClick);
   document.getElementById('app').addEventListener('dblclick', onDblClick);
+  // Delegated input handler — keeps the debug field and reject-feedback textarea
+  // bound to state so the 1.5s morph repaint never wipes in-progress keystrokes.
+  document.getElementById('app').addEventListener('input', onInput);
+  document.addEventListener('keydown', onKey); // Esc closes the modal, Enter submits
+}
+
+function onInput(e) {
+  const t = e.target;
+  if (!t) return;
+  if (t.id === 'debugInput') {
+    state.debugJobId = t.value;
+    if (state.debugMsg) { state.debugMsg = ''; const m = document.getElementById('debugMsg'); if (m) m.textContent = ''; }
+    return;
+  }
+  const fb = t.getAttribute && t.getAttribute('data-fb');
+  if (fb != null) state.feedbackDraft[fb] = t.value;
+}
+
+// The "Debug a job" modal lives outside #main (never morphed): toggle its
+// visibility and sync the input value + message from state each render, so
+// value-binding survives the 1.5s poll repaint and the cursor never jumps.
+function renderDebugModal() {
+  const overlay = document.getElementById('debugModal');
+  if (!overlay) return;
+  overlay.style.display = state.debugOpen ? 'flex' : 'none';
+  const di = document.getElementById('debugInput');
+  if (di && document.activeElement !== di && di.value !== state.debugJobId) di.value = state.debugJobId;
+  const msg = document.getElementById('debugMsg');
+  if (msg && msg.textContent !== state.debugMsg) msg.textContent = state.debugMsg;
+}
+function openDebugModal(open) {
+  state.debugOpen = open;
+  state.debugMsg = '';
+  renderDebugModal();
+  if (open) { const di = document.getElementById('debugInput'); if (di) { di.focus(); di.select(); } }
+}
+// Esc closes the modal; Enter in the job-id field starts the run.
+function onKey(e) {
+  if (!state.debugOpen) return;
+  if (e.key === 'Escape') openDebugModal(false);
+  else if (e.key === 'Enter' && e.target && e.target.id === 'debugInput') { e.preventDefault(); debugStart(); }
+}
+// The Abort button (header) is shown only while a run is live — a stage is
+// running or waiting. It lives outside #main, so toggle it imperatively each render.
+function renderAbort() {
+  const b = document.getElementById('abortBtn');
+  if (!b) return;
+  const active = (model.topStats.running || 0) > 0 || (model.topStats.waiting || 0) > 0;
+  b.style.display = active ? 'inline-flex' : 'none';
+}
+// Force-stop the in-progress run: the server tree-kills it via run.lock.json's pid.
+async function abortRun() {
+  if (!window.confirm('Abort the running pipeline? This force-kills the run process and its headed browser.')) return;
+  await postCommand({ cmd: 'abort' }); // next poll picks up run_finished(aborted); the cut-off stage flips to failed
 }
 
 function renderClock() {
@@ -350,8 +546,8 @@ function renderTopStats() {
     { label: 'Running',     value: String(s.running), color: COLORS.running },
     { label: 'Waiting',     value: String(s.waiting), color: COLORS.waiting },
     { label: 'Blocked',     value: String(s.blocked), color: COLORS.blocked },
-    { label: 'QA 1st-pass', value: s.qaRate + '%',    color: s.qaRate >= 50 ? COLORS.done : COLORS.failed },
-    { label: 'Spend',       value: fmtCost(null),     color: '#c9d4de' },
+    { label: 'Fixes ready', value: String(s.done),    color: s.done > 0 ? COLORS.done : '#c9d4de' },
+    { label: 'Cases',       value: String(s.cases ?? 0), color: (s.cases ?? 0) > 0 ? COLORS.done : '#c9d4de' },
   ];
   setHtml(document.getElementById('topstats'), chips.map(c => `
     <div style="display:flex;flex-direction:column;justify-content:center;padding:4px 12px;border:1px solid #1c232c;border-radius:8px;background:#0b0f15;min-width:78px">
@@ -369,7 +565,7 @@ function renderProduct() {
 function renderNav() {
   const navDef = [
     { key: 'overview',      label: 'Overview',      icon: '▦' },
-    { key: 'tickets',       label: 'Tickets',       icon: '≡', badge: String(model.tickets.length) },
+    { key: 'tickets',       label: 'Jobs',          icon: '≡', badge: String(model.tickets.length) },
     { key: 'gates',         label: 'Gate results',  icon: '◆' },
     { key: 'observability', label: 'Observability', icon: '∿' },
   ];
@@ -418,8 +614,8 @@ function renderOverview() {
       ${attn.map(t => {
         const sm = statusMeta(t.status);
         const note = t.status === 'blocked'
-          ? `retry cap reached at QA — ${t.implAttempts} implement attempts`
-          : 'review produced — paused for y/n in terminal';
+          ? `retry cap reached at review — ${t.implAttempts} implement attempts`
+          : `${(t.stages[t.current] || {}).label || 'a stage'} awaiting your y/n in the terminal`;
         return `<button data-act="open" data-id="${esc(t.id)}" style="display:flex;align-items:center;gap:9px;padding:9px 13px;border-radius:9px;border:1px solid ${sm.color}44;background:${sm.color}12;cursor:pointer;text-align:left">
           <span style="width:8px;height:8px;border-radius:50%;background:${sm.color};flex:0 0 auto;animation:${dotAnim(t.status === 'waiting' ? 'waiting' : 'blocked')}"></span>
           <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:${sm.color};font-weight:600">${esc(sm.label.split(' ')[0].toUpperCase())}</span>
@@ -437,14 +633,14 @@ function renderOverview() {
     const stLabel = cur.label || t.current;
     const sel = state.heroId === t.id ? 'background:#12171d' : '';
     return `<div data-act="hero" data-dbl data-id="${esc(t.id)}" style="display:flex;align-items:center;gap:11px;padding:9px 16px;border-bottom:1px solid #12171d;cursor:pointer;${sel}">
-      <span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#6b7682;width:30px;flex:0 0 auto">${esc(t.id)}</span>
+      <span title="${esc(t.id)}" style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#6b7682;width:72px;flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(shortId(t.id))}</span>
       <span style="width:6px;height:6px;border-radius:50%;background:${sm.color};flex:0 0 auto;animation:${dotAnim(cur.state)}"></span>
       <span style="flex:1;min-width:0;font-size:13px;color:#dbe4ec;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.title)}</span>
       <span style="font-size:11px;color:#7d8892;width:80px;flex:0 0 auto;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(productName)}</span>
       <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8b98a5;width:74px;flex:0 0 auto;text-align:right">${esc(stLabel)}</span>
       <span style="${pill(t.status)}">${esc(sm.label)}</span>
     </div>`;
-  }).join('') : emptyRow('No tickets yet — run the pipeline to see them here.');
+  }).join('') : emptyRow('No jobs yet — run npm run sdlc debug <jobId> to see them here.');
 
   // activity feed
   const activity = model.activity.length ? model.activity.map(e => {
@@ -469,7 +665,7 @@ function renderOverview() {
     <div style="display:grid;grid-template-columns:1.35fr 1fr;gap:16px;margin-top:18px">
       <section style="background:#0f141b;border:1px solid #1c232c;border-radius:12px;overflow:hidden">
         <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #1c232c">
-          <span style="font-size:13px;font-weight:600">Tickets</span>
+          <span style="font-size:13px;font-weight:600">Jobs</span>
           <span style="font-size:11px;color:#5c6773">click to load pipeline · double for detail</span>
         </div>
         ${ticketRows}
@@ -490,7 +686,7 @@ function renderHeroCard(hero) {
   if (!hero) {
     return `<section style="background:#0f141b;border:1px solid #1c232c;border-radius:14px;padding:48px 24px;margin-top:6px;text-align:center;color:#5c6773">
       <div style="font-size:14px;color:#8b98a5;margin-bottom:6px">No ticket selected</div>
-      <div style="font-size:12.5px">Run the pipeline (<span style="font-family:'IBM Plex Mono',monospace">npm run sdlc run &lt;id&gt;</span>) to populate this view.</div>
+      <div style="font-size:12.5px">Run the pipeline (<span style="font-family:'IBM Plex Mono',monospace">npm run sdlc debug &lt;jobId&gt;</span>) to populate this view.</div>
     </section>`;
   }
   const sm = statusMeta(hero.status);
@@ -530,13 +726,17 @@ function renderHeroCard(hero) {
     </div>`;
   }).join('');
 
-  // feedback belt geometry (7 nodes; impl idx 2, qa idx 5)
-  const xImpl = (2 + 0.5) / 7 * 1000, xQa = (5 + 0.5) / 7 * 1000;
+  // feedback belt geometry — from the actual node indices (review → implement)
+  const nStages = STAGES.length;
+  const idxImpl = STAGES.findIndex(s => s.key === 'implement');
+  const idxReview = STAGES.findIndex(s => s.key === 'review');
+  const xImpl = ((idxImpl < 0 ? 0 : idxImpl) + 0.5) / nStages * 1000;
+  const xFrom = ((idxReview < 0 ? nStages - 1 : idxReview) + 0.5) / nStages * 1000;
   const beltActive = hero.beltLoops > 0;
   const beltStroke = beltActive ? COLORS.blocked : '#2a323d';
   const beltAnim = beltActive ? 'animation:sdlcDash 1.1s linear infinite' : '';
   const beltText = beltActive ? ('back to Implement · ×' + hero.beltLoops) : 'belt idle';
-  const badgeLeft = ((xImpl + xQa) / 2 / 1000 * 100).toFixed(1);
+  const badgeLeft = ((xImpl + xFrom) / 2 / 1000 * 100).toFixed(1);
 
   return `<section style="background:#0f141b;border:1px solid #1c232c;border-radius:14px;padding:22px 24px 16px;margin-top:6px">
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px">
@@ -554,10 +754,10 @@ function renderHeroCard(hero) {
       </div>
       <button data-act="open" data-id="${esc(hero.id)}" style="flex:0 0 auto;font-size:12.5px;color:#4f9dff;padding:7px 12px;border:1px solid #1c2e44;border-radius:8px;background:#0c1826;white-space:nowrap;cursor:pointer">View full history →</button>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:10px;position:relative">${nodes}</div>
+    <div style="display:grid;grid-template-columns:repeat(${nStages},1fr);gap:10px;position:relative">${nodes}</div>
     <div style="position:relative;height:74px;margin-top:2px">
       <svg width="100%" height="74" viewBox="0 0 1000 150" preserveAspectRatio="none" style="position:absolute;inset:0;overflow:visible">
-        <path d="M ${xQa.toFixed(1)} 8 C ${xQa.toFixed(1)} 128, ${xImpl.toFixed(1)} 128, ${xImpl.toFixed(1)} 8" fill="none" stroke="${beltStroke}" stroke-width="${beltActive ? '2.5' : '1.5'}" stroke-dasharray="7 6" stroke-linecap="round" style="${beltAnim}"></path>
+        <path d="M ${xFrom.toFixed(1)} 8 C ${xFrom.toFixed(1)} 128, ${xImpl.toFixed(1)} 128, ${xImpl.toFixed(1)} 8" fill="none" stroke="${beltStroke}" stroke-width="${beltActive ? '2.5' : '1.5'}" stroke-dasharray="7 6" stroke-linecap="round" style="${beltAnim}"></path>
         <circle cx="${xImpl.toFixed(1)}" cy="8" r="5" fill="${beltStroke}"></circle>
       </svg>
       <div style="position:absolute;left:${badgeLeft}%;top:44px;transform:translateX(-50%);display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:20px;background:#0f141b;border:1px solid ${beltActive ? COLORS.blocked + '66' : '#232b34'};color:${beltActive ? COLORS.blocked : '#5c6773'}">
@@ -578,7 +778,7 @@ function renderTickets() {
     const beltColor = t.beltLoops > 0 ? COLORS.blocked : '#4a545f';
     const beltLabel = t.beltLoops > 0 ? ('↺ ×' + t.beltLoops) : '—';
     return `<div data-act="open" data-id="${esc(t.id)}" style="display:flex;align-items:center;gap:14px;padding:12px 16px;border-bottom:1px solid #12171d;cursor:pointer">
-      <span style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#8b98a5;width:34px;flex:0 0 auto">${esc(t.id)}</span>
+      <span title="${esc(t.id)}" style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:#8b98a5;width:74px;flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(shortId(t.id))}</span>
       <div style="flex:1;min-width:0">
         <div style="font-size:13.5px;color:#e6edf3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(t.title)}</div>
         <div style="font-size:11px;color:#6b7682;font-family:'IBM Plex Mono',monospace;margin-top:2px">${esc(t.branch)}</div>
@@ -588,13 +788,13 @@ function renderTickets() {
       <span style="width:70px;flex:0 0 auto;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:${beltColor}">${esc(beltLabel)}</span>
       <span style="width:120px;flex:0 0 auto;display:flex;justify-content:flex-end"><span style="${pill(t.status)}">${esc(sm.label)}</span></span>
     </div>`;
-  }).join('') : emptyRow('No tickets yet.');
+  }).join('') : emptyRow('No jobs yet.');
 
   return `<div style="padding:20px 22px 40px;animation:sdlcFade .25s ease">
-    <h1 style="margin:0 0 16px;font-size:17px;font-weight:600">Tickets</h1>
+    <h1 style="margin:0 0 16px;font-size:17px;font-weight:600">Jobs</h1>
     <div style="background:#0f141b;border:1px solid #1c232c;border-radius:12px;overflow:hidden">
       <div style="display:flex;align-items:center;gap:14px;padding:9px 16px;border-bottom:1px solid #1c232c;font-size:10.5px;color:#5c6773;letter-spacing:.4px;text-transform:uppercase">
-        <span style="width:34px;flex:0 0 auto">ID</span>
+        <span style="width:74px;flex:0 0 auto">ID</span>
         <span style="flex:1">Title</span>
         <span style="width:120px;flex:0 0 auto">Product</span>
         <span style="width:110px;flex:0 0 auto">Stage</span>
@@ -639,12 +839,12 @@ function renderGates() {
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">${checks}</div>
       ${feedback}
     </div>`;
-  }).join('') : emptyRow('No gate results yet — the QA gate has not run for any ticket.');
+  }).join('') : emptyRow('No gate results yet — no review has run for any job.');
 
   return `<div style="padding:20px 22px 40px;animation:sdlcFade .25s ease">
     <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px">
       <h1 style="margin:0;font-size:17px;font-weight:600;white-space:nowrap">Gate results</h1>
-      <span style="font-size:12px;color:#5c6773">deterministic checks for the QA gate — every attempt</span>
+      <span style="font-size:12px;color:#5c6773">the review gate — a [BLOCKER] finding belts work back to implement</span>
     </div>
     <div style="display:flex;flex-direction:column;gap:11px">${cards}</div>
   </div>`;
@@ -724,11 +924,105 @@ function renderObs() {
   </div>`;
 }
 
+// The in-tab control-plane block: when the stage behind the active artifact tab
+// is paused awaiting approval, render (at the top of the tab) the produced-output
+// preview + Approve/Reject. reproduce is special: Approve/Reject only, no preview,
+// no feedback. All model text goes through esc()/parseMd — no raw-HTML sink.
+function renderApproval(sel, activeTab) {
+  const stage = TAB_STAGE[activeTab];
+  if (!stage) return '';
+  const st = sel.stages[stage];
+  if (!st || st.state !== 'waiting' || !st.promptId) return '';
+  const promptId = st.promptId;
+  const isReproduce = stage === 'reproduce';
+  const key = sel.id + '__' + stage;
+  const wcol = COLORS.waiting;
+
+  // request.json (question + previewPath), cached per promptId.
+  const req = requestCache.get(promptId);
+  if (req === undefined) {
+    // Momentary (request.json is written before the awaiting_approval event); fetch
+    // and show a light placeholder — no actionable buttons until the pause is confirmed live.
+    loadRequest(sel.id, stage, promptId).then(rerender);
+    return `<div style="margin-bottom:16px;padding:14px 15px;border:1px solid ${wcol}55;border-radius:10px;background:${wcol}0e;font-size:12px;color:#5c6773">Loading approval…</div>`;
+  }
+  if (req === null || req.promptId !== promptId) {
+    // request.json is GONE — the approval was already settled + cleaned up, or the
+    // run ended. The stage is effectively resolved even though its last event is
+    // still awaiting_approval (no settle event is emitted). Suppress the stale
+    // controls; the next poll re-derives the stage out of "waiting". This also
+    // covers reproduce's long post-approval window (headed scrape runs for minutes).
+    return '';
+  }
+
+  // Live pause. "submitting…" is scoped to THIS promptId (a re-pause of the same
+  // stage — reject→revise, or the review belt — mints a NEW promptId → fresh
+  // buttons, never a frozen "submitting…") and time-boxed so a decision against a
+  // dead run surfaces a retry hint instead of freezing forever.
+  const SUBMIT_TIMEOUT_MS = 12000;
+  const dec = state.decision[key] || {};
+  const busyForThis = !!dec.busy && dec.promptId === promptId;
+  const stale = busyForThis && (Date.now() - (dec.ts || 0) > SUBMIT_TIMEOUT_MS);
+  const busy = busyForThis && !stale;
+  const draft = state.feedbackDraft[key] || '';
+  const rejecting = !!state.rejectOpen[key];
+
+  const question = req.question ? String(req.question) : '';
+  let previewHtml = '';
+  if (!isReproduce && req.previewPath) {
+    const pv = previewCache.get(promptId);
+    if (pv === undefined) {
+      loadPreview(promptId, req.previewPath).then(rerender);
+      previewHtml = `<div style="padding:18px;text-align:center;color:#5c6773;font-size:12px">loading preview…</div>`;
+    } else if (pv) {
+      previewHtml = `<div style="max-height:280px;overflow:auto;padding:2px 4px 6px">${parseMd(pv)}</div>`;
+    }
+  }
+
+  const btn = (act, label, extra) =>
+    `<button data-act="${act}" data-id="${esc(sel.id)}" data-stage="${esc(stage)}" data-prompt="${esc(promptId)}" style="${extra}">${esc(label)}</button>`;
+  const approveStyle = `padding:7px 15px;border-radius:8px;border:1px solid ${COLORS.done}66;background:${COLORS.done}18;color:${COLORS.done};font-size:12.5px;font-weight:600;cursor:pointer`;
+  const rejectStyle = `padding:7px 15px;border-radius:8px;border:1px solid ${COLORS.failed}55;background:${COLORS.failed}14;color:${COLORS.failed};font-size:12.5px;font-weight:600;cursor:pointer`;
+
+  let controls;
+  if (busy) {
+    controls = `<span style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:${wcol};animation:sdlcBlink 1.4s ease-in-out infinite">submitting…</span>`;
+  } else if (isReproduce) {
+    // reproduce: no feedback — Reject submits immediately.
+    controls = btn('approve', 'Approve', approveStyle) + btn('reject-submit', 'Reject', rejectStyle);
+  } else if (rejecting) {
+    controls = `<div style="width:100%">
+        <textarea data-fb="${esc(key)}" placeholder="Optional feedback for the agent…" rows="3" style="width:100%;box-sizing:border-box;resize:vertical;padding:8px 10px;background:#0c1016;border:1px solid #1c232c;border-radius:8px;color:#e6edf3;font-family:'IBM Plex Sans',system-ui,sans-serif;font-size:12.5px;line-height:1.5;outline:none">${esc(draft)}</textarea>
+        <div style="display:flex;gap:9px;margin-top:8px">${btn('reject-submit', 'Submit rejection', rejectStyle)}</div>
+      </div>`;
+  } else {
+    controls = btn('approve', 'Approve', approveStyle) + btn('reject-open', 'Reject…', rejectStyle);
+  }
+
+  const errMsg = stale
+    ? `<div style="margin-top:9px;font-size:11.5px;color:${COLORS.failed}">No response yet — the run may have stopped. You can retry.</div>`
+    : ((dec.msg && dec.promptId === promptId && !busy)
+        ? `<div style="margin-top:9px;font-size:11.5px;color:${COLORS.failed}">${esc(dec.msg)}</div>`
+        : '');
+
+  return `<div style="margin-bottom:16px;padding:14px 15px;border:1px solid ${wcol}55;border-radius:10px;background:${wcol}0e">
+    <div style="display:flex;align-items:center;gap:9px;margin-bottom:10px">
+      <span style="width:8px;height:8px;border-radius:50%;background:${wcol};flex:0 0 auto;animation:sdlcPulse 1.5s ease-in-out infinite"></span>
+      <span style="font-size:13px;font-weight:600;color:#e6edf3">Awaiting your approval</span>
+      <span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#8b98a5">${esc(st.label || stage)}</span>
+    </div>
+    ${question ? `<div style="font-size:12.5px;color:#c9d4de;margin-bottom:${previewHtml ? '10' : '12'}px">${esc(question)}</div>` : ''}
+    ${previewHtml ? `<div style="border:1px solid #1c232c;border-radius:8px;background:#0c1016;padding:10px 12px;margin-bottom:12px">${previewHtml}</div>` : ''}
+    <div style="display:flex;align-items:flex-start;gap:9px;flex-wrap:wrap">${controls}</div>
+    ${errMsg}
+  </div>`;
+}
+
 // ---------- TICKET DETAIL ----------
 function renderDetail() {
   const sel = model.tickets.find(t => t.id === state.detailId) || model.tickets[0] || null;
   if (!sel) {
-    return `<div style="padding:40px;text-align:center;color:#5c6773">No ticket to show. <button data-act="back" style="background:none;border:none;color:#4f9dff;cursor:pointer">Back</button></div>`;
+    return `<div style="padding:40px;text-align:center;color:#5c6773">No job to show. <button data-act="back" style="background:none;border:none;color:#4f9dff;cursor:pointer">Back</button></div>`;
   }
   const sm = statusMeta(sel.status);
   const oCol = kindColor(sel.outcome.kind);
@@ -774,14 +1068,15 @@ function renderDetail() {
   // artifacts
   const activeTab = state.artifactTab[sel.id] || defaultTab(sel.id);
   prefetchAll(sel.id);
-  const dir = (TABS.find(t => t[0] === activeTab) || TABS[0])[2];
-  const rec = artifactCache.get(dir + '/' + sel.id);
+  const tab = TABS.find(t => t.key === activeTab) || TABS[0];
+  const rec = artifactCache.get(tab.key + '/' + sel.id);
+  const relPath = tab.path(sel.id).replace(/^\/data\//, '');
   let artBody;
   if (!rec) {
     artBody = `<div style="padding:50px 20px;text-align:center;color:#5c6773;font-size:12.5px">loading…</div>`;
-    loadArtifact(dir, sel.id).then(rerender);
+    loadArtifact(tab, sel.id).then(rerender);
   } else if (rec.status === 'ok') {
-    artBody = `<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5c6773;margin-bottom:14px;padding-bottom:10px;border-bottom:1px dashed #1c232c">${esc(dir)}/${esc(sel.id)}.md</div><div>${parseMd(rec.body)}</div>`;
+    artBody = `<div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5c6773;margin-bottom:14px;padding-bottom:10px;border-bottom:1px dashed #1c232c">${esc(relPath)}</div><div>${parseMd(rec.body)}</div>`;
   } else {
     artBody = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:60px 20px;text-align:center">
       <span style="width:36px;height:36px;border-radius:9px;border:1px dashed #2a323d;display:flex;align-items:center;justify-content:center;color:#4a545f;font-size:18px">∅</span>
@@ -789,12 +1084,12 @@ function renderDetail() {
       <div style="font-size:11.5px;color:#5c6773;max-width:260px">${esc(MISS_NOTE[activeTab] || '')}</div>
     </div>`;
   }
-  const tabs = TABS.map(([key, label, d]) => {
-    const r = artifactCache.get(d + '/' + sel.id);
+  const tabs = TABS.map(t => {
+    const r = artifactCache.get(t.key + '/' + sel.id);
     const avail = r && r.status === 'ok';
-    const active = key === activeTab;
+    const active = t.key === activeTab;
     const color = active ? '#e6edf3' : (avail ? '#8b98a5' : '#4a545f');
-    return `<button data-act="tab" data-tab="${key}" style="padding:8px 13px;border:none;border-bottom:2px solid ${active ? ACCENT : 'transparent'};background:none;cursor:pointer;font-size:12.5px;white-space:nowrap;color:${color};font-weight:${active ? 600 : 400}">${esc(label)}</button>`;
+    return `<button data-act="tab" data-tab="${t.key}" style="padding:8px 13px;border:none;border-bottom:2px solid ${active ? ACCENT : 'transparent'};background:none;cursor:pointer;font-size:12.5px;white-space:nowrap;color:${color};font-weight:${active ? 600 : 400}">${esc(t.label)}</button>`;
   }).join('');
 
   return `<div style="padding:18px 22px 40px;animation:sdlcFade .25s ease">
@@ -816,6 +1111,7 @@ function renderDetail() {
         <div style="font-size:14px;font-weight:600;margin-top:2px">${esc(sel.outcome.text)}</div>
       </div>
     </div>
+    ${renderContextPanel(sel)}
     <div style="display:grid;grid-template-columns:minmax(360px,1.05fr) 1.2fr;gap:16px;margin-top:16px;align-items:start">
       <section style="background:#0f141b;border:1px solid #1c232c;border-radius:12px;overflow:hidden">
         <div style="padding:12px 16px;border-bottom:1px solid #1c232c;font-size:13px;font-weight:600">Stage history <span style="color:#5c6773;font-weight:400">· in order, incl. belt loops</span></div>
@@ -823,18 +1119,68 @@ function renderDetail() {
       </section>
       <section style="background:#0f141b;border:1px solid #1c232c;border-radius:12px;overflow:hidden;position:sticky;top:0">
         <div style="display:flex;align-items:center;gap:2px;padding:8px 8px 0;border-bottom:1px solid #1c232c;flex-wrap:wrap">${tabs}</div>
-        <div style="padding:18px 22px;max-height:520px;overflow:auto;font-size:13px;line-height:1.6">${artBody}</div>
+        <div style="padding:18px 22px;max-height:520px;overflow:auto;font-size:13px;line-height:1.6">${renderApproval(sel, activeTab)}${artBody}</div>
       </section>
     </div>
     ${renderKbSection(sel)}
   </div>`;
 }
 
+// The fetched debug context: the Mongo/Sentry evidence the pipeline started from,
+// plus the prod error screenshot rendered inline (served under /data/context/<id>/).
+function renderContextPanel(sel) {
+  const ctx = contextCache.get(sel.id);
+  const header = `<div style="padding:12px 16px;border-bottom:1px solid #1c232c;display:flex;align-items:baseline;gap:10px">
+      <span style="font-size:13px;font-weight:600">Debug context</span>
+      <span style="font-size:11.5px;color:#5c6773">the Mongo + Sentry evidence this job's fix started from</span>
+    </div>`;
+  let inner;
+  if (ctx === undefined) {
+    inner = `<div style="padding:16px;color:#5c6773;font-size:12px">loading…</div>`;
+    loadContext(sel.id).then(rerender);
+  } else if (!ctx) {
+    inner = `<div style="padding:16px;color:#5c6773;font-size:12px">No fetched context — run <span style="font-family:'IBM Plex Mono',monospace;color:#c9d4de">npm run sdlc fetch ${esc(sel.id)}</span> (or <span style="font-family:'IBM Plex Mono',monospace;color:#c9d4de">debug</span>).</div>`;
+  } else {
+    const m = ctx.mongo || {};
+    const facts = [['Status', m.status], ['Portal', m.portalName], ['Customer', m.customerName], ['Finished', m.finishedAt]]
+      .filter(([, v]) => v)
+      .map(([k, v]) => `<span style="font-size:12px;color:#a7b2bd"><span style="color:#5c6773">${esc(k)}:</span> <span style="font-family:'IBM Plex Mono',monospace;color:#dbe4ec">${esc(v)}</span></span>`)
+      .join('<span style="color:#2a323d">·</span>');
+    const errs = [...new Set((ctx.sentry || []).flatMap(s => (s.events || []).map(e => e.title)).filter(Boolean))].slice(0, 4);
+    const errList = errs.length
+      ? `<div style="margin-top:11px;display:flex;flex-direction:column;gap:5px">${errs.map(t => `<div style="font-size:12px;color:#e0a7ac;font-family:'IBM Plex Mono',monospace;background:#1a1214;border:1px solid #3a2226;border-radius:6px;padding:5px 9px">${esc(t)}</div>`).join('')}</div>`
+      : '';
+    const imgs = (ctx.artifacts || []).filter(a => a.localPath && /\.(png|jpe?g|webp|svg)$/i.test(a.localPath));
+    // Folded by default: the <img>s are only put in the DOM (fetched/decoded) when
+    // expanded — keeps the detail view light and avoids a heavy paint on open.
+    const open = !!state.shotsOpen[sel.id];
+    const shots = imgs.length
+      ? `<div style="margin-top:12px">
+          <button data-act="toggleShots" style="display:inline-flex;align-items:center;gap:8px;padding:6px 11px;border:1px solid #1c232c;border-radius:8px;background:#0b0f15;cursor:pointer;color:#c9d4de;font-size:12px;font-family:inherit">
+            <span style="font-family:'IBM Plex Mono',monospace;color:#8b98a5">${open ? '▾' : '▸'}</span>
+            ${open ? 'Hide' : 'Show'} screenshots
+            <span style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:#7d8892;background:#12171d;border-radius:5px;padding:1px 6px">${imgs.length}</span>
+          </button>
+          ${open ? `<div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">${imgs.map(a => {
+            const src = '/data/context/' + esc(sel.id) + '/' + esc(a.localPath);
+            return `<a href="${src}" target="_blank" title="${esc(a.name || 'screenshot')} — open full size" style="display:block;border:1px solid #1c232c;border-radius:8px;overflow:hidden;max-width:300px"><img src="${src}" alt="${esc(a.name || 'screenshot')}" loading="lazy" style="display:block;max-width:300px;height:auto;background:#0c1016"></a>`;
+          }).join('')}</div>` : ''}
+        </div>`
+      : `<div style="margin-top:10px;font-size:11.5px;color:#5c6773">No screenshot on the Sentry event for this job.</div>`;
+    inner = `<div style="padding:14px 16px">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">${facts || '<span style="font-size:12px;color:#5c6773">no job fields captured</span>'}</div>
+      ${errList}
+      ${shots}
+    </div>`;
+  }
+  return `<section style="background:#0f141b;border:1px solid #1c232c;border-radius:12px;overflow:hidden;margin-top:16px">${header}${inner}</section>`;
+}
+
 function renderKbSection(sel) {
   const entries = Object.entries(sel.kbByStage || {});
   let inner;
   if (!entries.length) {
-    inner = `<div style="font-size:12px;color:#5c6773">No KB activity recorded for this ticket yet.</div>`;
+    inner = `<div style="font-size:12px;color:#5c6773">No KB activity recorded for this job yet.</div>`;
   } else {
     inner = entries.map(([stageKey, info]) => {
       const st = STAGES.find(s => s.key === stageKey);
@@ -911,6 +1257,8 @@ function render() {
   renderTopStats();
   renderProduct();
   renderNav();
+  renderDebugModal();
+  renderAbort();
   setHtml(document.getElementById('main'), currentViewHtml());
 }
 
@@ -936,11 +1284,75 @@ function onClick(e) {
   else if (act === 'hero') { state.heroId = id; rerender(); }
   else if (act === 'open') { openDetail(id); }
   else if (act === 'back') { state.view = 'overview'; rerender(); }
+  else if (act === 'toggleShots') { state.shotsOpen[state.detailId] = !state.shotsOpen[state.detailId]; rerender(); }
   else if (act === 'tab') {
-    const tab = el.getAttribute('data-tab');
-    state.artifactTab[state.detailId] = tab;
-    const dir = (TABS.find(t => t[0] === tab) || TABS[0])[2];
-    if (!artifactCache.has(dir + '/' + state.detailId)) loadArtifact(dir, state.detailId).then(rerender);
+    const key = el.getAttribute('data-tab');
+    state.artifactTab[state.detailId] = key;
+    const tab = TABS.find(t => t.key === key) || TABS[0];
+    if (!artifactCache.has(tab.key + '/' + state.detailId)) loadArtifact(tab, state.detailId).then(rerender);
+    rerender();
+  }
+  else if (act === 'debug-open') { openDebugModal(true); }
+  else if (act === 'debug-close') { openDebugModal(false); }
+  else if (act === 'debug-start') { debugStart(); }
+  else if (act === 'abort') { abortRun(); }
+  else if (act === 'approve') { submitDecision(el, 'approve'); }
+  else if (act === 'reject-open') {
+    const k = el.getAttribute('data-id') + '__' + el.getAttribute('data-stage');
+    state.rejectOpen[k] = true;
+    rerender();
+  }
+  else if (act === 'reject-submit') { submitDecision(el, 'reject'); }
+}
+
+// Start a run from the header box: client-validate the 24-hex jobId, POST it,
+// and surface the outcome (202 clears the box; 409 = a run is already up).
+let debugStarting = false;
+async function debugStart() {
+  if (debugStarting) return; // in-flight guard — a double-click must not spawn two consoles
+  const jobId = (state.debugJobId || '').trim();
+  if (!/^[a-f0-9]{24}$/i.test(jobId)) { state.debugMsg = 'Enter a valid 24-char job id.'; renderDebugModal(); return; }
+  debugStarting = true;
+  state.debugMsg = 'starting…'; renderDebugModal();
+  try {
+    const { status, json } = await postCommand({ cmd: 'start', jobId });
+    if (status === 202) { state.debugJobId = ''; state.debugMsg = ''; state.debugOpen = false; } // close on success
+    else if (status === 409) { state.debugMsg = 'a run is already in progress'; }
+    else if (status === 0) { state.debugMsg = 'could not reach the server'; }
+    else { state.debugMsg = (json && json.error) || ('error ' + status); }
+  } finally {
+    debugStarting = false;
+    renderDebugModal();
+  }
+}
+
+// Approve/reject a paused stage. Optimistic "submitting…"; the next 1.5s poll
+// observes the stage leaving "waiting" and the whole block disappears.
+async function submitDecision(el, decision) {
+  const ticket = el.getAttribute('data-id');
+  const stage = el.getAttribute('data-stage');
+  const promptId = el.getAttribute('data-prompt');
+  const key = ticket + '__' + stage;
+  const cur = state.decision[key];
+  if (cur && cur.busy && cur.promptId === promptId) return; // ignore double-clicks on THIS pause
+  const body = { cmd: 'decision', ticket, stage, promptId, decision };
+  if (decision === 'reject') body.feedback = state.feedbackDraft[key] || '';
+  state.decision[key] = { busy: true, msg: '', promptId, ts: Date.now() };
+  rerender();
+  // Repaint after the optimistic-submit timeout so a decision nothing consumes
+  // (dead/crashed run) recovers to a retry hint instead of a frozen "submitting…".
+  setTimeout(rerender, 12300);
+  const { status, json } = await postCommand(body);
+  if (status === 200) {
+    state.rejectOpen[key] = false;
+    // stay "submitting…" — the poll re-derives the stage out of "waiting" once the
+    // orchestrator consumes the decision (and the timeout above recovers if it can't).
+  } else {
+    let msg;
+    if (status === 409) msg = (json && json.error) || 'no longer pending (already decided or stale)';
+    else if (status === 0) msg = 'could not reach the server';
+    else msg = (json && json.error) || ('error ' + status);
+    state.decision[key] = { busy: false, msg, promptId };
     rerender();
   }
 }

@@ -25,3 +25,8 @@ node_modules/
 # via .gitkeep so it always exists for the fetch to write into.
 /context/*
 !/context/.gitkeep
+
+# Dashboard control-plane files (the awaiting-approval request/decision/preview
+# files + run.lock.json). The preview files hold un-approved agent output derived
+# from real customer/Sentry data — per-run, local-only, never committed.
+/approvals/
