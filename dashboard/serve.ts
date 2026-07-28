@@ -96,6 +96,18 @@ function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | n
   });
 }
 
+// Quotes a value for safe use as a single POSIX shell argument.
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+// Escapes a shell command for embedding in an AppleScript double-quoted string
+// literal (backslash and double-quote are the only two characters that matter
+// there). Apply this ONCE, to the fully-built shell command string.
+function escapeAppleScriptString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
 // Spawn a run in a fresh VISIBLE console so the reproduce stage's headed browser
 // shows and there's a real TTY for the portal password. jobId is regex-validated
 // by the caller, so the interpolated command string is safe.
@@ -108,6 +120,14 @@ function spawnRun(jobId: string): void {
       windowsHide: false,
       stdio: "ignore",
     });
+    child.unref();
+  } else if (process.platform === "darwin") {
+    // osascript -e 'tell application "Terminal" to do script "..."' opens a new
+    // Terminal.app window and runs the command with a real TTY attached — the
+    // macOS equivalent of the Windows `start cmd /k` branch above.
+    const shellCmd = `cd ${shellQuote(ROOT)} && npm run sdlc debug ${jobId}`;
+    const script = `tell application "Terminal" to do script "${escapeAppleScriptString(shellCmd)}"`;
+    const child = spawn("osascript", ["-e", script], { detached: true, stdio: "ignore" });
     child.unref();
   } else {
     const child = spawn("npm", ["run", "sdlc", "debug", jobId], {
