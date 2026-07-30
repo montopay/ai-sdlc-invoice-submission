@@ -28,7 +28,20 @@ export const STAGES = [
   { key: "test", label: "Test", gate: "auto" },
   { key: "qa", label: "QA Gate", gate: "hard" },
 ];
+// Post-run LEARNING stages: the retrospector writes a retro, then the curator
+// proposes KB cases (run.ts: stage "retrospector" then "curator-product"). They run
+// AFTER the pipeline, only when config.learning.enabled, and are NOT part of
+// STAGE_ORDER — so they're derived and shown as pipeline nodes but deliberately kept
+// OUT of the pass/fail status math below (which stays keyed on STAGES).
+export const LEARNING_STAGES = [
+  { key: "retrospector", label: "Retro", gate: "learn" },
+  { key: "curator-product", label: "Curator", gate: "learn" },
+];
+// Every node the pipeline overview draws, in order. STAGES drives status/current/
+// done; the learning tail is visual-only.
+export const ALL_STAGES = [...STAGES, ...LEARNING_STAGES];
 const STAGE_KEYS = new Set(STAGES.map((s) => s.key));
+const LEARNING_KEYS = new Set(LEARNING_STAGES.map((s) => s.key));
 
 export const COLORS = {
   done: "#34d399", running: "#22d3ee", waiting: "#f5b83d", failed: "#fb7185",
@@ -99,7 +112,11 @@ function deriveTicket(id, runlog, events, meta, now) {
   const runStarts = ev.filter((e) => e.type === "run_started");
   const lastRun = runStarts.length ? runStarts[runStarts.length - 1] : null;
   const runStartTs = lastRun ? tsMs(lastRun) : null;
-  const startIdx = lastRun ? STAGES.findIndex((s) => s.key === lastRun.startStage) : -1;
+  // Index within ALL_STAGES (STAGES + learning tail). For STAGES keys this equals
+  // their STAGES index, so run-scoping is unchanged; learning keys land after them
+  // (7,8) so they scope to the current run too.
+  const startIdx = lastRun ? ALL_STAGES.findIndex((s) => s.key === lastRun.startStage) : -1;
+  const learningEnabled = !!(m.config && m.config.learning && m.config.learning.enabled);
   // A run_finished for the current run means the orchestrator stopped — completed,
   // aborted from the dashboard, or crashed. Any stage still "running"/"waiting"
   // afterwards is stale (its process is gone), so we show it as failed below rather
@@ -109,8 +126,8 @@ function deriveTicket(id, runlog, events, meta, now) {
   // Per-stage state. Prefer the events lifecycle (has ordering + running/
   // waiting); fall back to runlog for tickets that predate events.jsonl.
   const stages = {};
-  for (const st of STAGES) {
-    const stIdx = STAGES.indexOf(st);
+  for (const st of ALL_STAGES) {
+    const stIdx = ALL_STAGES.indexOf(st);
     const rlFor = rl.filter((e) => e.stage === st.key);
     const lastRl = rlFor[rlFor.length - 1] || null;
     // A fresh run re-does stages at/after its startStage; scope those to
@@ -125,17 +142,21 @@ function deriveTicket(id, runlog, events, meta, now) {
 
     if (evFor.length) {
       // Find the latest lifecycle marker.
-      let lastStarted = -1, lastFinished = -1, lastAwait = -1, finishedEv = null;
+      let lastStarted = -1, lastFinished = -1, lastAwait = -1, lastRunning = -1, finishedEv = null;
       evFor.forEach((e, i) => {
         if (e.type === "stage_started") lastStarted = i;
         else if (e.type === "awaiting_approval") { lastAwait = i; awaitEv = e; }
+        else if (e.type === "stage_running") lastRunning = i;
         else if (e.type === "stage_finished") { lastFinished = i; finishedEv = e; }
       });
       const startedAttempts = evFor.filter((e) => e.type === "stage_started").length;
       attempts = Math.max(attempts, startedAttempts);
       if (lastStarted > lastFinished) {
-        // In progress: waiting for a human if awaiting_approval came after start.
-        state = lastAwait > lastStarted ? "waiting" : "running";
+        // "waiting" only while awaiting_approval is the LATEST lifecycle marker. A
+        // stage_running emitted after it means the human already approved and work
+        // resumed (e.g. reproduce's long headed browser run) — show running, not a
+        // stale "waiting for approval".
+        state = (lastAwait > lastStarted && lastAwait > lastRunning) ? "waiting" : "running";
       } else if (finishedEv) {
         state = finishedEv.approved === true ? "done" : "failed";
         if (finishedEv.durationMs != null) durationMs = finishedEv.durationMs;
@@ -150,7 +171,13 @@ function deriveTicket(id, runlog, events, meta, now) {
     // shown as "skipped" rather than "not reached" — the pipeline is bypassing
     // it on purpose. Real run history (a stage that ran before being disabled)
     // still wins: we only relabel the untouched "todo".
-    const skipped = evFor.some((e) => e.type === "stage_skipped") || stageDisabled(st.key, m.config);
+    // Learning stages are "skipped" when the learning loop is off in config — same
+    // treatment as a stage turned off with enabled:false, so they read as OFF rather
+    // than a perpetually "not reached" node.
+    const skipped =
+      evFor.some((e) => e.type === "stage_skipped") ||
+      stageDisabled(st.key, m.config) ||
+      (LEARNING_KEYS.has(st.key) && !learningEnabled);
     if (skipped && state === "todo") state = "skipped";
     if (st.planned) state = "planned"; // Deploy is never real yet
 

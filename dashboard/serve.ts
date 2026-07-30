@@ -23,14 +23,15 @@
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, unlinkSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, unlinkSync, readdirSync, createWriteStream } from "node:fs";
 import { resolve, extname, sep } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 const ROOT = resolve(process.cwd()); // pipeline repo root — the data
 const APP = resolve(ROOT, "dashboard"); // the dashboard app assets
 const APPROVALS = resolve(ROOT, "approvals"); // control-plane files (gitignored)
+const LOGS = resolve(ROOT, "logs"); // per-run captured console output (gitignored)
 const PORT = Number(process.env.DASHBOARD_PORT ?? 4300);
 
 const STAGES = ["reproduce", "investigate", "spec", "review", "test"] as const;
@@ -43,6 +44,7 @@ const TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".jsonl": "application/x-ndjson; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -96,47 +98,49 @@ function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | n
   });
 }
 
-// Quotes a value for safe use as a single POSIX shell argument.
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
+// The one live run this dashboard is managing. We spawn the pipeline as a CHILD
+// (piped stdio) rather than a detached console, so its output streams INTO the
+// dashboard and — the one interactive moment — the portal password can be handed
+// to it over stdin. Held here so POST /command {cmd:"password"} can reach stdin.
+let currentRun: { jobId: string; child: ChildProcess } | null = null;
 
-// Escapes a shell command for embedding in an AppleScript double-quoted string
-// literal (backslash and double-quote are the only two characters that matter
-// there). Apply this ONCE, to the fully-built shell command string.
-function escapeAppleScriptString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-// Spawn a run in a fresh VISIBLE console so the reproduce stage's headed browser
-// shows and there's a real TTY for the portal password. jobId is regex-validated
-// by the caller, so the interpolated command string is safe.
+// Start a run as a managed child of the dashboard. No visible console: stdout +
+// stderr are tee'd to logs/<jobId>.log (which the dashboard tails over /data), and
+// stdin stays open so the portal password can be written to it later. The headed
+// reproduce browser still opens its OWN OS window — that's Chromium, not a console.
+// SDLC_DASHBOARD_RUN tells run.ts it may collect the password over stdin instead of
+// demanding a TTY.
+//
+// We spawn a DIRECT node child (the tsx loader) rather than `npm run … ` through a
+// shell, on purpose: (a) the password we later write to child.stdin then reaches
+// run.ts's process.stdin unmediated — no cmd.exe / npm.cmd link that could swallow
+// piped stdin on Windows — and (b) run.lock.json's pid IS this child's pid, so the
+// abort route's tree-kill and our child handle refer to the same process. The
+// args-array form with shell:false has no quoting or DEP0190 concerns (jobId is also
+// regex-validated by the caller). `node --import tsx pipeline/run.ts` is exactly what
+// the `npm run sdlc` script (`tsx pipeline/run.ts`) resolves to.
 function spawnRun(jobId: string): void {
-  if (process.platform === "win32") {
-    const CMD = `npm run sdlc debug ${jobId}`;
-    const child = spawn("cmd", ["/c", "start", "", "cmd", "/k", CMD], {
-      cwd: ROOT,
-      detached: true,
-      windowsHide: false,
-      stdio: "ignore",
-    });
-    child.unref();
-  } else if (process.platform === "darwin") {
-    // osascript -e 'tell application "Terminal" to do script "..."' opens a new
-    // Terminal.app window and runs the command with a real TTY attached — the
-    // macOS equivalent of the Windows `start cmd /k` branch above.
-    const shellCmd = `cd ${shellQuote(ROOT)} && npm run sdlc debug ${jobId}`;
-    const script = `tell application "Terminal" to do script "${escapeAppleScriptString(shellCmd)}"`;
-    const child = spawn("osascript", ["-e", script], { detached: true, stdio: "ignore" });
-    child.unref();
-  } else {
-    const child = spawn("npm", ["run", "sdlc", "debug", jobId], {
-      cwd: ROOT,
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
-  }
+  mkdirSync(LOGS, { recursive: true });
+  const logPath = resolve(LOGS, `${jobId}.log`);
+  // Fresh log each run (flags:"w" truncates), with a header so the pane isn't
+  // blank during the initial context fetch.
+  const log = createWriteStream(logPath, { flags: "w" });
+  log.write(`$ npm run sdlc debug ${jobId}\n  ${new Date().toISOString()}\n\n`);
+
+  const child = spawn(process.execPath, ["--import", "tsx", "pipeline/run.ts", "debug", jobId], {
+    cwd: ROOT,
+    env: { ...process.env, SDLC_DASHBOARD_RUN: "1" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout?.on("data", (c: Buffer) => log.write(c));
+  child.stderr?.on("data", (c: Buffer) => log.write(c));
+  currentRun = { jobId, child };
+  const clear = () => {
+    if (currentRun && currentRun.child === child) currentRun = null;
+    try { log.end(); } catch { /* already closed */ }
+  };
+  child.on("close", clear);
+  child.on("error", clear);
 }
 
 // Force-kill a process and its whole child tree — the orchestrator spawns the
@@ -188,6 +192,11 @@ async function handleCommand(
   if (cmd === "start") {
     const jobId = body.jobId;
     if (typeof jobId !== "string" || !ID_RE.test(jobId)) return sendJson(400, { error: "invalid jobId" });
+    // Fastest guard: a child we're already managing. This closes the window during
+    // the run's initial `fetch` phase, BEFORE it writes run.lock.json, where the
+    // file check below would otherwise see no lock and let a second run spawn.
+    if (currentRun && currentRun.child.exitCode === null && !currentRun.child.killed)
+      return sendJson(409, { error: "a run is already in progress" });
     // Fail fast if a run is already live. The orchestrator re-acquires the lock
     // authoritatively; we only read it to avoid double-spawning.
     try {
@@ -245,6 +254,39 @@ async function handleCommand(
       renameSync(tmp, decisionPath);
     } catch {
       return sendJson(500, { error: "could not record decision" });
+    }
+    return sendJson(200, { ok: true });
+  }
+
+  if (cmd === "password") {
+    // Hand the portal password to the live run over its stdin. Deliberately NOT
+    // file-channelled: the secret goes browser -> this route -> the child's stdin,
+    // never touching disk or a log. run.ts (dashboard mode) reads exactly one line
+    // with echo OFF, so it never lands in logs/<jobId>.log either. Validated against
+    // the pending approvals/<jobId>__password.request.json the run wrote.
+    const jobId = body.jobId;
+    const promptId = body.promptId;
+    const password = body.password;
+    if (typeof jobId !== "string" || !ID_RE.test(jobId)) return sendJson(400, { error: "invalid jobId" });
+    if (typeof promptId !== "string" || !promptId) return sendJson(400, { error: "invalid promptId" });
+    if (typeof password !== "string" || !password || password.length > 512)
+      return sendJson(400, { error: "invalid password" });
+    if (!currentRun || currentRun.jobId !== jobId || !currentRun.child.stdin || currentRun.child.stdin.destroyed)
+      return sendJson(409, { error: "no run awaiting a password" });
+
+    const reqPath = resolve(APPROVALS, `${jobId}__password.request.json`);
+    let request: Record<string, unknown>;
+    try {
+      request = JSON.parse(readFileSync(reqPath, "utf8"));
+    } catch {
+      return sendJson(409, { error: "no pending password prompt" });
+    }
+    if (request.promptId !== promptId) return sendJson(409, { error: "stale" });
+
+    try {
+      currentRun.child.stdin.write(password + "\n");
+    } catch {
+      return sendJson(500, { error: "could not deliver password" });
     }
     return sendJson(200, { ok: true });
   }

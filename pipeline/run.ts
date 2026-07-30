@@ -607,6 +607,44 @@ async function promptText(question: string): Promise<string> {
   return answer.trim();
 }
 
+// Read ONE line from stdin with NO echo: passing no `output` stream leaves
+// readline's terminal mode off, so the incoming bytes are never written back out —
+// the secret can't leak into the dashboard's captured logs/<jobId>.log. Used only
+// in dashboard mode, where the line is written to this process's stdin by the server.
+async function readSecretLine(): Promise<string> {
+  const rl = createInterface({ input: process.stdin });
+  const line = await rl.question("");
+  rl.close();
+  return line;
+}
+
+// Dashboard mode: collect the portal password over stdin instead of a TTY. We write
+// approvals/<jobId>__password.request.json (the dashboard shows a masked field for
+// it), the server writes the submitted value to this process's stdin — gated on the
+// promptId in that file — and we read it here with echo off. The value is NEVER
+// written to disk or a log. runId ties the request file to this run so the
+// orchestrator's stale-sweep and the dashboard's abort clean it up if we die.
+async function awaitPasswordViaDashboard(jobId: string, question: string, runId?: string): Promise<string> {
+  mkdirSync("approvals", { recursive: true });
+  const reqPath = `approvals/${jobId}__password.request.json`;
+  const promptId = randomUUID();
+  writeFileSync(reqPath, JSON.stringify({ jobId, promptId, runId, question, ts: new Date().toISOString() }, null, 2));
+  emitEvent("awaiting_password", { ticket: jobId, runId, promptId });
+  // The LABEL (never the secret) prints to stdout so the captured log shows the wait.
+  console.log(`\n${question} — waiting for the portal password from the dashboard…`);
+  try {
+    const password = await readSecretLine();
+    return password.trim();
+  } finally {
+    try {
+      unlinkSync(reqPath);
+    } catch {
+      /* best effort */
+    }
+    emitEvent("password_received", { ticket: jobId, runId });
+  }
+}
+
 // ---- Dashboard control plane: approvals (file <-> HTTP handoff) ----
 
 // Repo-root-relative paths for a given pause, keyed by <TICKET>__<STAGE>. The
@@ -2142,7 +2180,7 @@ function renderReproduceMd(
 // password, run the real scraper HEADED (draft-only), and CAPTURE the result to
 // context/<id>/reproduce.md so the investigate stage can read it. Throws on setup
 // errors (missing context/creds/cwd). Returns the exit code + artifact path.
-async function doReproduce(uploadJobId: string, config: Config): Promise<{ exitCode: number | null; mdPath: string }> {
+async function doReproduce(uploadJobId: string, config: Config, opts: { runId?: string } = {}): Promise<{ exitCode: number | null; mdPath: string }> {
   if (!config.reproduce) throw new Error("sdlc.config.json has no `reproduce` block (see its _comment_reproduce note).");
   if (!config.fetch) throw new Error("reproduce builds its input from the `fetch.mongo` config, which is missing.");
 
@@ -2157,18 +2195,24 @@ async function doReproduce(uploadJobId: string, config: Config): Promise<{ exitC
     throw new Error("MONGODB_URI is required in this repo's .env — reproduce builds the scraper input from the Mongo step.");
   }
 
-  // The portal password is prompted STRICTLY over the terminal — never file-
-  // channelled. Without a TTY (e.g. a dashboard-triggered pause where nobody is at
-  // this console) there's no safe way to collect it, so fail loudly. In the
-  // reproduce STAGE the surrounding try/catch turns this into "continue without
-  // reproduction" (no hang); the standalone reproduce command surfaces it as an error.
-  if (!process.stdin.isTTY) {
+  // The portal password is collected interactively and NEVER file-channelled. Over a
+  // real terminal we prompt on the TTY; when the DASHBOARD launched this run (no TTY,
+  // SDLC_DASHBOARD_RUN set) we collect it over stdin via a masked dashboard field
+  // (echo off — never hits the captured log). A non-TTY run that is NEITHER is a dead
+  // end, so fail loudly. In the reproduce STAGE the surrounding try/catch turns this
+  // into "continue without reproduction" (no hang); the standalone reproduce command
+  // surfaces it as an error.
+  const passwordPrompt = config.reproduce.passwordPrompt ?? "Portal password";
+  let password: string;
+  if (process.stdin.isTTY) {
+    password = await promptText(passwordPrompt);
+  } else if (process.env.SDLC_DASHBOARD_RUN) {
+    password = await awaitPasswordViaDashboard(uploadJobId, passwordPrompt, opts.runId);
+  } else {
     throw new Error(
-      "reproduce needs a TTY for the portal password — run from a terminal, or set reproduce mode to skip"
+      "reproduce needs a TTY for the portal password — run from a terminal, use the dashboard, or set reproduce mode to skip"
     );
   }
-
-  const password = await promptText(config.reproduce.passwordPrompt ?? "Portal password");
   if (!password) throw new Error("No password entered — aborting reproduce.");
 
   // Build a SELF-CONTAINED input from the Mongo step (the upload_jobs aggregation), so
@@ -2265,8 +2309,13 @@ async function runStageReproduce(ticketId: string, mode: StageMode, ctx: Ctx): P
     return finish({ ran: false });
   }
 
+  // The y/n was answered "yes" (or auto mode) — reproduce is now actively running the
+  // headed browser for minutes. Emit stage_running so the dashboard flips the stage
+  // from "waiting for approval" to "running" (the approval is already granted).
+  emitEvent("stage_running", { ticket: ticketId, stage: "reproduce", runId: ctx.runId });
+
   try {
-    const { exitCode, mdPath } = await doReproduce(ticketId, ctx.config);
+    const { exitCode, mdPath } = await doReproduce(ticketId, ctx.config, { runId: ctx.runId });
     console.log(`\nreproduce: captured → ${mdPath} (exit ${exitCode}).`);
     return finish({ ran: true, exitCode });
   } catch (err) {
