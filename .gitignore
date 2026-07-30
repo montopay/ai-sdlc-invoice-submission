@@ -30,3 +30,8 @@ node_modules/
 # files + run.lock.json). The preview files hold un-approved agent output derived
 # from real customer/Sentry data — per-run, local-only, never committed.
 /approvals/
+
+# Captured console output of dashboard-launched runs (one logs/<jobId>.log per
+# run, tee'd from the managed child so the dashboard can tail it). Per-run, local.
+# (*.log above already covers the files; this documents the folder.)
+/logs/

@@ -283,12 +283,29 @@ export function normalizeSentryEvent(
   }
 
   const crumbEntry = entries.find((e) => e?.type === "breadcrumbs");
-  const breadcrumbs: SentryBreadcrumb[] = (crumbEntry?.data?.values ?? []).map((b: any) => ({
-    category: b.category,
-    level: b.level,
-    message: b.message,
-    timestamp: b.timestamp ? String(b.timestamp) : undefined,
-  }));
+  const breadcrumbs: SentryBreadcrumb[] = (crumbEntry?.data?.values ?? [])
+    .map((b: any) => {
+      let message: string | undefined = b.message ?? undefined;
+      // Sentry `http` breadcrumbs carry the request in b.data (url/method/status_code),
+      // NOT b.message — the old code read only b.message, so every http crumb rendered
+      // as a blank "[info] http" line (they were the bulk of context.md). Surface the
+      // request instead so the line actually says something.
+      if (!message && b.data && (b.data.url || b.data.method || b.data.status_code != null)) {
+        const method = b.data.method ? String(b.data.method) : "";
+        const url = b.data.url ? String(b.data.url) : "";
+        const status = b.data.status_code ?? b.data.statusCode;
+        message = [method, url, status != null ? `→ ${status}` : ""].filter(Boolean).join(" ");
+      }
+      return {
+        category: b.category,
+        level: b.level,
+        message,
+        timestamp: b.timestamp ? String(b.timestamp) : undefined,
+      };
+    })
+    // Drop breadcrumbs that still carry no text — pure noise for the investigate agent
+    // (and wasted tokens). Cap AFTER filtering so the kept slots are real breadcrumbs.
+    .filter((b: SentryBreadcrumb) => !!(b.message && b.message.trim()));
 
   return {
     id: String(raw.eventID ?? raw.id ?? ""),
