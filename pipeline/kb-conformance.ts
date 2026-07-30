@@ -31,8 +31,13 @@ export type KbSpec = {
   // Frontmatter keys every concept must carry, non-empty (CONVENTIONS §5).
   requiredFrontmatter: string[];
   // Cite-the-source rule (CONVENTIONS §7.1): every concept must carry at least
-  // one of these keys, non-empty.
+  // one of these keys, non-empty. An empty [] DISABLES the citation check — for a
+  // KB whose own linter does not machine-enforce a source key.
   sourceKeys: string[];
+  // Extra required frontmatter keys for a specific `type`, beyond
+  // requiredFrontmatter. Lets a KB enforce shape on ONE content type (e.g. a Case
+  // needs use_case/outcome/source) without demanding those of every concept.
+  perTypeRequired?: Record<string, string[]>;
   // Bundle-root-relative files that are NOT concepts and are exempt from the
   // concept rules (CONVENTIONS §4: index.md files, plus the reserved root
   // files). index.md is handled specially everywhere; these are the rest.
@@ -47,44 +52,62 @@ export type KbSpec = {
   pipelineRefExempt?: string[];
 };
 
+// The knowledge bundle this fork is pointed at: the scraper KB's OKF LLM-wiki
+// (project.knowledgePath = .../scraper-knowledge-base/wiki). Its vocabulary and
+// area-based folder layout come from wiki/standards/metadata-standard.md, and this
+// spec deliberately mirrors what the KB's OWN linter (scripts/okf_lint.py)
+// hard-enforces — non-empty `type` + valid frontmatter — so it never bounces a
+// valid legacy page, while adding a per-type shape check for the Cases the curator mints.
 export const PRODUCT_KB_SPEC: KbSpec = {
-  name: "OKF product KB",
-  conceptTypes: ["Domain Rule", "Decision", "Module", "Data Model", "Workflow", "Reference"],
+  name: "Scraper KB (OKF LLM-wiki)",
+  conceptTypes: [
+    "Reference", "Standard", "Architecture", "Handler", "Handler Pattern",
+    "Portal", "Playbook", "Catalog", "Glossary", "Case", "Template",
+  ],
+  // Only types with a single, unambiguous home folder are enforced. `Reference`
+  // is DELIBERATELY unmapped: it legitimately appears in BOTH standards/ and
+  // handlers/, so a single-folder rule would false-positive on valid pages.
   typeToFolder: {
-    "Domain Rule": "domain",
-    Decision: "decisions",
-    Module: "modules",
-    "Data Model": "data",
-    Workflow: "workflows",
-    Reference: "references",
+    Portal: "portals",
+    Case: "cases",
+    Playbook: "adlc",
+    Architecture: "architecture",
+    Handler: "handlers",
+    "Handler Pattern": "handlers",
+    Catalog: "handlers",
+    Standard: "standards",
+    Glossary: "standards",
   },
-  requiredFrontmatter: ["type", "title", "description", "timestamp"],
-  sourceKeys: ["resource", "source_commit"],
-  reservedRootFiles: ["log.md", "README.md", "CONVENTIONS.md"],
-  // The KB describes the PRODUCT, so it must never cite pipeline process
-  // artifacts (CONVENTIONS §5, §7.1). These catch the two identifiers that are
-  // unambiguously pipeline-internal. Deliberately NOT matching generic words
-  // (spec/review/qa/pipeline) — those occur legitimately (e.g. "weekly review"
-  // in a life product, "SDLC pipeline" in the root index). Non-global regexes
-  // (.test is stateful on /g).
+  // Match the KB's own linter: only a non-empty `type` is hard-required
+  // (title/description/status/owner are recommended there, so requiring them would
+  // bounce valid legacy pages).
+  requiredFrontmatter: ["type"],
+  // The KB does not machine-enforce a source key — leave empty to disable the
+  // global citation check. A Case still MUST cite its origin (perTypeRequired).
+  sourceKeys: [],
+  // A Case is the one content type the curator mints from a run: require the fields
+  // that make it reusable + traceable. A Case's `source` IS the prod incident
+  // (uploadJob id / Sentry issue) — see the curator playbook (adlc/curator.md).
+  perTypeRequired: {
+    Case: ["use_case", "outcome", "source", "portals"],
+  },
+  // Within the wiki bundle only index.md (special-cased) and log.md (reserved by
+  // basename) are non-concepts; README/GOVERNANCE/CONVENTIONS live at the KB repo
+  // ROOT, outside this bundle, so nothing else needs reserving here.
+  reservedRootFiles: [],
+  // Keep durable pages about the product/portals: a fix's pipeline feature branch
+  // (feature/<jobId>, a 24-hex id) must never leak into the KB. No ticket-ref rule
+  // — this flow keys off uploadJob ids, which a Case legitimately cites.
   pipelineRefRules: [
     {
-      rule: "no-pipeline-ticket-ref",
-      pattern: /\bticket[ -]?\d+\b/i,
-      detail:
-        'references a pipeline ticket (e.g. "Ticket 002"/"ticket 2"). Cite a product ' +
-        "file (path or path:line), a product commit SHA, or an external doc — never a " +
-        "ticket id (CONVENTIONS §5, §7.1).",
-    },
-    {
       rule: "no-pipeline-branch-ref",
-      pattern: /\bfeature\/\d+/i,
+      pattern: /\bfeature\/[0-9a-f]{8,}/i,
       detail:
-        'references a pipeline feature branch (e.g. "feature/002"). resource/source_commit ' +
-        "must be a product commit SHA or product file, never a pipeline branch (CONVENTIONS §5, §7.1).",
+        'references a pipeline feature branch (e.g. "feature/<jobId>"). Cite the product ' +
+        "artifact instead — a code path/commit, or the uploadJob id / Sentry issue.",
     },
   ],
-  pipelineRefExempt: ["CONVENTIONS.md", "README.md"],
+  pipelineRefExempt: [],
 };
 
 // Extracts the leading `---`-delimited frontmatter block as a flat key->value
@@ -220,9 +243,19 @@ export function checkBundle(bundleRoot: string, spec: KbSpec): ConformanceResult
       add("type-vocabulary", rel, `type "${type}" is not in the closed vocabulary [${spec.conceptTypes.join(", ")}] (CONVENTIONS §3).`);
     }
 
-    const hasSource = spec.sourceKeys.some((k) => fm[k] && fm[k].length > 0);
-    if (!hasSource) {
-      add("cite-source", rel, `no source citation — a concept must carry at least one of [${spec.sourceKeys.join(", ")}] (CONVENTIONS §7.1).`);
+    if (spec.sourceKeys.length) {
+      const hasSource = spec.sourceKeys.some((k) => fm[k] && fm[k].length > 0);
+      if (!hasSource) {
+        add("cite-source", rel, `no source citation — a concept must carry at least one of [${spec.sourceKeys.join(", ")}].`);
+      }
+    }
+
+    // Extra required keys for this concept's `type` (e.g. a Case needs
+    // use_case/outcome/source), enforced only on that type — not every concept.
+    for (const key of (type && spec.perTypeRequired?.[type]) || []) {
+      if (!fm[key] || fm[key].length === 0) {
+        add("required-key", rel, `a "${type}" concept must carry non-empty frontmatter key \`${key}\`.`);
+      }
     }
 
     // Folder placement: concept ID = path (CONVENTIONS §4). A concept's

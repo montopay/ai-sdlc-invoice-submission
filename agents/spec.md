@@ -17,6 +17,11 @@ and CONVENTIONS — before writing the spec. Prefer a recorded decision or data
 shape over inventing a new one; if the spec must contradict one, say so
 explicitly so the reviewer sees it. Read only the concepts you need.
 
+Also: if the KB has a role playbook at `adlc/spec.md`, read it FIRST and follow it
+— it is your role-specific, product-specific guide. If a `cases/` library exists,
+scan `cases/index.md` for a prior incident matching this portal + error and factor
+any match into the spec.
+
 # Output contract
 Produce ONLY a markdown spec with these sections, no preamble:
 

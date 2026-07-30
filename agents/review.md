@@ -13,6 +13,11 @@ read the concepts relevant to this change — especially recorded CONVENTIONS,
 DECISIONS, and DATA MODELS — and judge the code against them. A violation of a
 recorded convention or decision is a finding. Read only the concepts you need.
 
+Also: if the KB has a role playbook at `adlc/review.md`, read it FIRST and follow
+it — it is your role-specific, product-specific guide. If a `cases/` library exists,
+scan `cases/index.md` for a prior incident matching this portal + error and check
+the fix against what that case learned.
+
 # Output contract
 Produce ONLY a markdown review:
 

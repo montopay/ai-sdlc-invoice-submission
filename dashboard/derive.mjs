@@ -16,19 +16,32 @@
 
 export const CAP = 3; // MAX_IMPLEMENT_ATTEMPTS / MAX_QA_ATTEMPTS in the pipeline
 
-// The pipeline's writing flow is 6 stages; Deploy is a planned future step, not
-// a real stage — rendered dimmed. gate: 'hard' = deterministic gate, 'soft' =
-// human approve pause, 'auto' = runs through.
+// The debugging flow: reproduce → investigate → spec → implement → review. test/qa
+// are kept in the list but disabled in config (rendered "skipped"/OFF); there is no
+// deploy. gate: 'hard' = deterministic gate, 'soft' = human approve pause, 'auto' = runs through.
 export const STAGES = [
-  { key: "parse", label: "Parse", gate: "auto" },
+  { key: "reproduce", label: "Reproduce", gate: "soft" },
+  { key: "investigate", label: "Investigate", gate: "soft" },
   { key: "spec", label: "Spec", gate: "soft" },
   { key: "implement", label: "Implement", gate: "auto" },
   { key: "review", label: "Review", gate: "hard" },
   { key: "test", label: "Test", gate: "auto" },
   { key: "qa", label: "QA Gate", gate: "hard" },
-  { key: "deploy", label: "Deploy", gate: "hard", planned: true },
 ];
+// Post-run LEARNING stages: the retrospector writes a retro, then the curator
+// proposes KB cases (run.ts: stage "retrospector" then "curator-product"). They run
+// AFTER the pipeline, only when config.learning.enabled, and are NOT part of
+// STAGE_ORDER — so they're derived and shown as pipeline nodes but deliberately kept
+// OUT of the pass/fail status math below (which stays keyed on STAGES).
+export const LEARNING_STAGES = [
+  { key: "retrospector", label: "Retro", gate: "learn" },
+  { key: "curator-product", label: "Curator", gate: "learn" },
+];
+// Every node the pipeline overview draws, in order. STAGES drives status/current/
+// done; the learning tail is visual-only.
+export const ALL_STAGES = [...STAGES, ...LEARNING_STAGES];
 const STAGE_KEYS = new Set(STAGES.map((s) => s.key));
+const LEARNING_KEYS = new Set(LEARNING_STAGES.map((s) => s.key));
 
 export const COLORS = {
   done: "#34d399", running: "#22d3ee", waiting: "#f5b83d", failed: "#fb7185",
@@ -88,44 +101,83 @@ function deriveTicket(id, runlog, events, meta, now) {
   const ev = events.filter((e) => String(e.ticket) === id);
   const m = (meta && meta[id]) || {};
 
+  // Scope each stage's CURRENT state to the latest run. events.jsonl/runlog.jsonl
+  // are append-only across every `sdlc run/debug` invocation with no run-id, so a
+  // PRIOR run's implement-rejected / spec-passed would otherwise show on a fresh
+  // run before we've reached those stages again. The last run_started marks the
+  // current run; its startStage says which stages this run re-does — stages
+  // at/after it reflect ONLY current-run events (todo until they run again), while
+  // earlier stages keep the state a prior run left them in. Tickets with no
+  // run_started (historical/runlog-only) keep the old unscoped behavior.
+  const runStarts = ev.filter((e) => e.type === "run_started");
+  const lastRun = runStarts.length ? runStarts[runStarts.length - 1] : null;
+  const runStartTs = lastRun ? tsMs(lastRun) : null;
+  // Index within ALL_STAGES (STAGES + learning tail). For STAGES keys this equals
+  // their STAGES index, so run-scoping is unchanged; learning keys land after them
+  // (7,8) so they scope to the current run too.
+  const startIdx = lastRun ? ALL_STAGES.findIndex((s) => s.key === lastRun.startStage) : -1;
+  const learningEnabled = !!(m.config && m.config.learning && m.config.learning.enabled);
+  // A run_finished for the current run means the orchestrator stopped — completed,
+  // aborted from the dashboard, or crashed. Any stage still "running"/"waiting"
+  // afterwards is stale (its process is gone), so we show it as failed below rather
+  // than leaving it perpetually live.
+  const runEnded = runStartTs != null && ev.some((e) => e.type === "run_finished" && (tsMs(e) ?? 0) >= runStartTs);
+
   // Per-stage state. Prefer the events lifecycle (has ordering + running/
   // waiting); fall back to runlog for tickets that predate events.jsonl.
   const stages = {};
-  for (const st of STAGES) {
+  for (const st of ALL_STAGES) {
+    const stIdx = ALL_STAGES.indexOf(st);
     const rlFor = rl.filter((e) => e.stage === st.key);
-    const evFor = ev.filter((e) => e.stage === st.key);
     const lastRl = rlFor[rlFor.length - 1] || null;
+    // A fresh run re-does stages at/after its startStage; scope those to
+    // current-run events so a prior run's outcome doesn't leak in as done/failed.
+    const scoped = runStartTs != null && startIdx >= 0 && stIdx >= startIdx;
+    const evFor = ev.filter((e) => e.stage === st.key && (!scoped || (tsMs(e) ?? 0) >= runStartTs));
 
     let state = "todo";
-    let durationMs = lastRl ? lastRl.durationMs ?? null : null;
-    let attempts = rlFor.length;
+    let durationMs = scoped ? null : (lastRl ? lastRl.durationMs ?? null : null);
+    let attempts = scoped ? 0 : rlFor.length;
+    let awaitEv = null;
 
     if (evFor.length) {
       // Find the latest lifecycle marker.
-      let lastStarted = -1, lastFinished = -1, lastAwait = -1, finishedEv = null;
+      let lastStarted = -1, lastFinished = -1, lastAwait = -1, lastRunning = -1, finishedEv = null;
       evFor.forEach((e, i) => {
         if (e.type === "stage_started") lastStarted = i;
-        else if (e.type === "awaiting_approval") lastAwait = i;
+        else if (e.type === "awaiting_approval") { lastAwait = i; awaitEv = e; }
+        else if (e.type === "stage_running") lastRunning = i;
         else if (e.type === "stage_finished") { lastFinished = i; finishedEv = e; }
       });
       const startedAttempts = evFor.filter((e) => e.type === "stage_started").length;
       attempts = Math.max(attempts, startedAttempts);
       if (lastStarted > lastFinished) {
-        // In progress: waiting for a human if awaiting_approval came after start.
-        state = lastAwait > lastStarted ? "waiting" : "running";
+        // "waiting" only while awaiting_approval is the LATEST lifecycle marker. A
+        // stage_running emitted after it means the human already approved and work
+        // resumed (e.g. reproduce's long headed browser run) — show running, not a
+        // stale "waiting for approval".
+        state = (lastAwait > lastStarted && lastAwait > lastRunning) ? "waiting" : "running";
       } else if (finishedEv) {
         state = finishedEv.approved === true ? "done" : "failed";
         if (finishedEv.durationMs != null) durationMs = finishedEv.durationMs;
       }
-    } else if (lastRl) {
+    } else if (lastRl && !scoped) {
       state = lastRl.approved === true ? "done" : "failed";
     }
+    // The run ended while this stage was still live → it was cut off (aborted/crashed).
+    if (runEnded && (state === "running" || state === "waiting")) state = "failed";
     // A stage turned off via sdlc.config.json (enabled:false), or one the
     // orchestrator emitted a stage_skipped event for, that never actually ran is
     // shown as "skipped" rather than "not reached" — the pipeline is bypassing
     // it on purpose. Real run history (a stage that ran before being disabled)
     // still wins: we only relabel the untouched "todo".
-    const skipped = evFor.some((e) => e.type === "stage_skipped") || stageDisabled(st.key, m.config);
+    // Learning stages are "skipped" when the learning loop is off in config — same
+    // treatment as a stage turned off with enabled:false, so they read as OFF rather
+    // than a perpetually "not reached" node.
+    const skipped =
+      evFor.some((e) => e.type === "stage_skipped") ||
+      stageDisabled(st.key, m.config) ||
+      (LEARNING_KEYS.has(st.key) && !learningEnabled);
     if (skipped && state === "todo") state = "skipped";
     if (st.planned) state = "planned"; // Deploy is never real yet
 
@@ -145,6 +197,14 @@ function deriveTicket(id, runlog, events, meta, now) {
       // during the silent E2E/coverage gate phase after the agent finishes.
       activeDetail: state === "running" || state === "waiting" ? activeDetailOf(evFor[evFor.length - 1]) : "",
     };
+    // Control-plane approval handle: when this stage is paused on the CURRENT
+    // run, expose the awaiting_approval event's promptId/runId/attempt so the
+    // dashboard can fetch the request.json and POST an approve/reject decision.
+    if (state === "waiting" && awaitEv && lastRun && awaitEv.runId === lastRun.runId) {
+      stages[st.key].promptId = awaitEv.promptId;
+      stages[st.key].runId = awaitEv.runId;
+      stages[st.key].attempt = awaitEv.attempt;
+    }
   }
 
   const implAttempts = stages.implement.attempts || 0;
@@ -161,27 +221,26 @@ function deriveTicket(id, runlog, events, meta, now) {
   // ticket status
   const anyRunning = STAGES.some((s) => stages[s.key].state === "running");
   const anyWaiting = STAGES.some((s) => stages[s.key].state === "waiting");
-  const qaDone = stages.qa.state === "done";
-  const qaFailed = stages.qa.state === "failed";
-  const blocked = qaFailed && implAttempts >= CAP;
-  // Terminal success = every active stage has passed. With qa enabled that means
-  // "qa passed"; with qa disabled it means "the last enabled stage passed".
+  const reviewFailed = stages.review.state === "failed";
+  const blocked = reviewFailed && implAttempts >= CAP;
+  // Terminal success = every active (enabled, non-skipped) stage has passed. With
+  // test/qa disabled that means "review passed".
   const finalDone = activeStages.length > 0 && activeStages.every((s) => stages[s.key].state === "done");
   let status = "in-progress";
   if (anyRunning) status = "running";
   else if (anyWaiting) status = "waiting";
   else if (blocked) status = "blocked";
-  else if (finalDone) status = "done"; // last enabled stage passed = terminal success (no deploy yet)
+  else if (finalDone) status = "done"; // last enabled stage (review) passed = terminal success
 
   // current stage
-  let current = "parse";
+  let current = STAGES[0].key;
   if (status === "running") current = STAGES.find((s) => stages[s.key].state === "running").key;
   else if (status === "waiting") current = STAGES.find((s) => stages[s.key].state === "waiting").key;
-  else if (blocked) current = "qa";
-  else if (status === "done") current = lastActive ? lastActive.key : "qa";
+  else if (blocked) current = "review";
+  else if (status === "done") current = lastActive ? lastActive.key : "review";
   else {
     const todo = STAGES.find((s) => !s.planned && stages[s.key].state === "todo");
-    current = todo ? todo.key : (lastActive ? lastActive.key : "qa");
+    current = todo ? todo.key : (lastActive ? lastActive.key : "review");
   }
 
   const doneCount = activeStages.filter((s) => stages[s.key].state === "done").length;
@@ -223,7 +282,7 @@ function deriveTicket(id, runlog, events, meta, now) {
 
   const outcome = outcomeOf(status);
   return {
-    id, title: m.title || "Ticket " + id, branch: m.branch || "feature/" + id, product: m.product || "",
+    id, title: m.title || "Job " + id, branch: m.branch || "feature/" + id, product: m.product || "",
     stages, status, current, implAttempts, beltLoops, infraRetries, doneCount, activeStageCount: activeStages.length,
     kbByStage, timeline, lastTs, outcome, ents: rl,
   };
@@ -247,8 +306,8 @@ function activeDetailOf(e) {
 
 function stageMode(key, config) {
   if (config && config.stages && config.stages[key] && config.stages[key].mode) return config.stages[key].mode;
-  // sensible default matching the template's shipped config
-  return key === "parse" || key === "spec" ? "approve" : "auto";
+  // sensible default matching the shipped config (the text-producing stages pause)
+  return key === "reproduce" || key === "investigate" || key === "spec" ? "approve" : "auto";
 }
 
 // A stage is disabled only when config explicitly says enabled:false. Absent
@@ -260,7 +319,7 @@ function stageDisabled(key, config) {
 
 function outcomeOf(status) {
   switch (status) {
-    case "done": return { text: "Done · QA passed", kind: "done" };
+    case "done": return { text: "Done · fix reviewed", kind: "done" };
     case "blocked": return { text: "Blocked — human needed", kind: "blocked" };
     case "running": return { text: "In progress", kind: "running" };
     case "waiting": return { text: "Paused for approval", kind: "waiting" };
@@ -311,16 +370,21 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
 
   const allEnts = tickets.flatMap((t) => t.ents); // deduped, across tickets
   const count = (s) => tickets.filter((t) => t.status === s).length;
-  const qaReached = tickets.filter((t) => t.stages.qa.attempts > 0);
-  const qaFirst = qaReached.filter((t) => {
-    const firstQa = t.ents.find((e) => e.stage === "qa");
-    return firstQa && firstQa.approved === true;
-  }).length;
-  const qaRate = qaReached.length ? Math.round((qaFirst / qaReached.length) * 100) : 0;
+
+  // Debugging-flow metrics. "Cases" and "reproductions" come from events: the
+  // learning loop emits curator-product stage_finished, and the reproduce stage
+  // emits stage_finished with ran:true when a live reproduction actually ran.
+  const caseTickets = new Set(
+    events.filter((e) => e.type === "stage_finished" && e.stage === "curator-product").map((e) => String(e.ticket)),
+  );
+  const reproducedTickets = new Set(
+    events.filter((e) => e.type === "stage_finished" && e.stage === "reproduce" && e.ran === true).map((e) => String(e.ticket)),
+  );
+  const casesProposed = caseTickets.size;
 
   const topStats = {
     running: count("running"), waiting: count("waiting"),
-    blocked: count("blocked"), done: count("done"), qaRate,
+    blocked: count("blocked"), done: count("done"), cases: casesProposed,
   };
 
   // Recent activity — from events (they carry timestamps). Human-readable.
@@ -331,14 +395,15 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
     .filter(Boolean)
     .slice(0, 12);
 
-  // Gate results (QA attempts). Derived from runlog qa entries (deploy planned).
+  // Gate results — the REVIEW gate (a [BLOCKER] belts back to implement), one row
+  // per review attempt.
   const gateResults = [];
   for (const t of tickets) {
-    t.ents.filter((e) => e.stage === "qa").forEach((e) => {
+    t.ents.filter((e) => e.stage === "review").forEach((e) => {
       gateResults.push({
-        ticket: t.id, title: t.title, gate: "QA",
+        ticket: t.id, title: t.title, gate: "Review",
         attempt: e.attempt || 1,
-        verdict: e.approved === true ? "SHIP" : "NO-SHIP",
+        verdict: e.approved === true ? "CLEAN" : "BLOCKER",
         passed: e.approved === true,
         checks: gateChecks(e),
         feedback: e.feedback || "",
@@ -348,7 +413,6 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
 
   // Observability aggregates.
   const totalLoops = tickets.reduce((a, t) => a + t.beltLoops, 0);
-  const totalInfra = tickets.reduce((a, t) => a + t.infraRetries, 0);
   const stageAgg = STAGES.filter((s) => !s.planned).map((st) => {
     const se = allEnts.filter((e) => e.stage === st.key);
     const reached = tickets.filter((t) => t.stages[st.key].attempts > 0);
@@ -361,19 +425,19 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
     const avg = durs.length ? Math.round(durs.reduce((a, b) => a + b, 0) / durs.length) : null;
     return { key: st.key, label: st.label, gate: st.gate, rate, runs: se.length, avg, spend: null };
   });
-  const qaRealFails = allEnts.filter((e) => e.stage === "qa" && e.approved === false && e.gateKind !== "infra-failure").length;
+  const reviewRealFails = allEnts.filter((e) => e.stage === "review" && e.approved === false).length;
   const beltHot = [
-    { label: "QA Gate — real failures", count: qaRealFails, kind: "failed", sub: `caused ${totalLoops} implement re-runs` },
-    { label: "QA Gate — infra retries", count: totalInfra, kind: "waiting", sub: "gate re-run only — no belt loop" },
-    { label: "Deploy Gate", count: 0, kind: "todo", sub: "not implemented yet" },
+    { label: "Review — blockers", count: reviewRealFails, kind: "failed", sub: `caused ${totalLoops} implement re-runs` },
+    { label: "Reproductions run", count: reproducedTickets.size, kind: "running", sub: "live headed replays" },
+    { label: "Cases proposed", count: casesProposed, kind: "done", sub: "curator → KB PRs" },
   ];
   const obs = {
     tiles: [
-      { label: "Done", value: String(topStats.done), kind: "done", sub: "QA passed" },
+      { label: "Fixes ready", value: String(topStats.done), kind: "done", sub: "review passed" },
       { label: "Blocked", value: String(topStats.blocked), kind: "blocked", sub: "hit retry cap" },
-      { label: "Belt loops", value: String(totalLoops), kind: "blocked", sub: "implement re-runs" },
-      { label: "Infra retries", value: String(totalInfra), kind: "waiting", sub: "not product defects" },
-      { label: "Total spend", value: "—", kind: "todo", sub: "cost — later" },
+      { label: "Belt loops", value: String(totalLoops), kind: "blocked", sub: "review → implement" },
+      { label: "Reproduced", value: String(reproducedTickets.size), kind: "running", sub: "live replays" },
+      { label: "Cases", value: String(casesProposed), kind: "done", sub: "proposed to the KB" },
     ],
     stageAgg, beltHot,
   };

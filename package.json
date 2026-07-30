@@ -6,7 +6,8 @@
   "scripts": {
     "sdlc": "tsx pipeline/run.ts",
     "dashboard": "tsx dashboard/serve.ts",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test \"pipeline/**/*.test.ts\""
   },
   "repository": {
     "type": "git",
@@ -24,5 +25,8 @@
     "@types/node": "^26.1.0",
     "tsx": "^4.23.0",
     "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "mongodb": "^7.5.0"
   }
 }

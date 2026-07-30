@@ -19,3 +19,19 @@ node_modules/
 /retros/
 /curator/
 /events.jsonl
+
+# Pre-fetched debug context (npm run sdlc fetch). Contains REAL customer invoice
+# data + Sentry stack traces — stays local, never committed. The folder is kept
+# via .gitkeep so it always exists for the fetch to write into.
+/context/*
+!/context/.gitkeep
+
+# Dashboard control-plane files (the awaiting-approval request/decision/preview
+# files + run.lock.json). The preview files hold un-approved agent output derived
+# from real customer/Sentry data — per-run, local-only, never committed.
+/approvals/
+
+# Captured console output of dashboard-launched runs (one logs/<jobId>.log per
+# run, tee'd from the managed child so the dashboard can tail it). Per-run, local.
+# (*.log above already covers the files; this documents the folder.)
+/logs/

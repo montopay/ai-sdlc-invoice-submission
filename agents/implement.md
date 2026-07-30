@@ -17,6 +17,11 @@ read the concepts relevant to the spec — DATA MODELS, DECISIONS, and
 CONVENTIONS — before writing code. Follow recorded conventions and data shapes
 rather than inventing new ones. Read only the concepts you need.
 
+Also: if the KB has a role playbook at `adlc/implement.md`, read it FIRST and
+follow it — it is your role-specific, product-specific guide. If a `cases/` library
+exists, scan `cases/index.md` for a prior incident matching this portal + error and
+reuse the fix approach it records.
+
 # What to do
 - Create/complete whatever files the spec requires, wherever the product's
   own structure and conventions say they belong.
