@@ -62,16 +62,20 @@ A single markdown block, led by a TL;DR and then exactly these sections:
 1. **TL;DR** — 2–4 plain-English sentences a non-engineer can act on: what broke, what
    we need to do to resolve it, and **which repo changes** — the scraper repo
    (`ariba-scraper-main`), the shared `@montopay/base-scraper` package (a separate repo
-   the fix pipeline can't touch — flag it for a human), or **none** (a business error,
-   a portal-side change, or a transient/timeout — no code fix). Lead the ticket with
+   the fix pipeline can't touch — flag it for a human), or **none of the code repos**
+   (a business error, a portal-side change, a transient/timeout, or a bad config a human
+   fixes — no code change). Lead the ticket with
    this; if no code change is needed, say so plainly. The sections below back it up.
    **End the TL;DR with a verdict line, on its own line, exactly:** `Resolution: <verdict>`
-   where `<verdict>` is one of `code-fix (scraper)`, `code-fix (base-scraper)`,
-   `no-fix: business`, `no-fix: portal-side`, or `no-fix: transient`. The orchestrator
-   parses this line: any `no-fix` verdict makes the pipeline SKIP the fix stages
-   (spec/implement/review) and finish at the learning loop, which records the case + KB
-   update. Only claim `no-fix` when you are sure — corroborate a business error against
-   the `page.html`/screenshot, since some "NotFound" errors are really selector drift
+   where `<verdict>` has one of two shapes: **`code-fix (<repo>)`** — a real code change
+   (runs the fix stages) — or **`no-fix: <reason>`** — no code change (skips them). The
+   product KB playbook (`adlc/investigate.md`) enumerates the exact verdicts valid for
+   this domain — the code-fix repos, and the `no-fix:` reasons (business, portal-side,
+   transient, schema-config, …) — so follow its list rather than inventing values. The
+   orchestrator parses this line: any `no-fix` verdict makes the pipeline SKIP the fix
+   stages (spec/implement/review) and finish at the learning loop, which records the
+   case + KB update. Only claim `no-fix` when you are sure — corroborate against the
+   `page.html`/screenshot, since some "NotFound" errors are really selector drift
    (= a real code fix, `code-fix (scraper)`).
 2. **Root cause** — what failed and why in the running automation. Cite the
    evidence: the Sentry error + the specific stack frame / source line, what the

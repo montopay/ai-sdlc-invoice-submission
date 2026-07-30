@@ -185,6 +185,9 @@ test("curateJob keeps debugging fields and drops heavy payloads", () => {
   assert.equal(c.screenshots[0].key, "s1.png");
   assert.equal(c.videos[0].key, "v1.mp4");
   assert.equal(c.lastErrorScreenshot.key, "shots/last.png");
+  // buyerId + jobPayload field KEYS surfaced (for schema / history lookups); values dropped
+  assert.equal(c.buyerId, "b1");
+  assert.deepEqual(c.jobPayloadFields, ["invoice"]);
   // heavy fields dropped
   assert.equal((c as any).jobPayload, undefined);
   assert.equal((c as any).draftPayload, undefined);
@@ -395,6 +398,9 @@ test("renderContextMarkdown surfaces the id, status, error, and a sentry event",
   assert.match(md, /Portal login failed/);
   assert.match(md, /upload-invoice/);
   assert.match(md, /TimeoutError/);
+  // buyerId + payload field keys surfaced for the schema-config / history technique
+  assert.match(md, /Buyer id/);
+  assert.match(md, /Payload fields/);
 });
 
 test("renderContextMarkdown notes when there are no matching Sentry events", () => {

@@ -53,6 +53,12 @@ export type CuratedJob = {
   finishedAt?: string;
   portalName?: string;
   customerName?: string;
+  buyerId?: string;
+  // The dynamic-form field KEYS present in the job's jobPayload (keys only, no
+  // values) — the schema-declared fields the automation fills. Lets the investigate
+  // stage see which field failed and cross-check the buyer's upload_invoice_schemas
+  // + upload_jobs history without re-querying Mongo.
+  jobPayloadFields?: string[];
   ai?: boolean | null;
   autoLaunch?: boolean | null;
   sfExecutionArn?: string;
@@ -192,6 +198,12 @@ export function curateJob(doc: Record<string, any>): CuratedJob {
     finishedAt: doc.finishedAt ? String(doc.finishedAt) : undefined,
     portalName: doc.portalName,
     customerName: doc.customerName,
+    buyerId:
+      doc.buyerId != null ? String(doc.buyerId) : doc.buyer?._id != null ? String(doc.buyer._id) : undefined,
+    jobPayloadFields:
+      doc.jobPayload && typeof doc.jobPayload === "object" && !Array.isArray(doc.jobPayload)
+        ? Object.keys(doc.jobPayload)
+        : undefined,
     ai: doc.ai ?? undefined,
     autoLaunch: doc.autoLaunch ?? undefined,
     sfExecutionArn: doc.sfExecutionArn,
@@ -647,6 +659,10 @@ export function renderContextMarkdown(ctx: JobContext): string {
     L.push("");
     L.push(`- **Status:** ${m.status ?? "(unknown)"}`);
     L.push(`- **Portal:** ${m.portalName ?? "(unknown)"} · **Customer:** ${m.customerName ?? "(unknown)"}`);
+    if (m.buyerId)
+      L.push(`- **Buyer id:** \`${m.buyerId}\` (key for \`upload_invoice_schemas\` + \`upload_jobs\` history lookups)`);
+    if (m.jobPayloadFields?.length)
+      L.push(`- **Payload fields** (\`jobPayload\` keys): ${m.jobPayloadFields.map((k) => `\`${k}\``).join(", ")}`);
     L.push(`- **AI:** ${m.ai ?? "?"} · **Auto-launch:** ${m.autoLaunch ?? "?"}`);
     L.push(`- **Timing:** created ${m.createdAt ?? "?"} · started ${m.startedAt ?? "?"} · finished ${m.finishedAt ?? "?"}`);
     if (m.sfExecutionArn) L.push(`- **sfExecutionArn:** \`${m.sfExecutionArn}\``);
