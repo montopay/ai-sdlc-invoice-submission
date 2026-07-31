@@ -660,6 +660,109 @@ export async function fetchUploadJobContext(
 // -------------------------------------------------------------------------
 // Rendering + artifact writing
 // -------------------------------------------------------------------------
+
+// Tags that repeat on every Sentry event and are redundant with fields we already show
+// (or with each other) — dropped from the aggregated view to cut the wall of k=v noise.
+const SENTRY_TAG_DROP = new Set([
+  "level",                            // already in the issue header
+  "os.name", "runtime.name", "user", // dups of os / runtime / portalUserId
+  "scraper.repository",              // long constant URL, no debugging value
+  "scraper.name", "scraper.version", // both already inside `release` (name@version)
+  "uploadJobId",                      // this whole document IS that job
+]);
+// Curated environment identifiers, shown on one line when constant across the issue.
+const SENTRY_ENV_TAGS = ["portalName", "environment", "release", "runtime", "os"];
+
+// Most http breadcrumbs are the scraper's OWN plumbing — log shipping (Datadog), the
+// ECS/EC2 metadata + SSM credential endpoints, and the localhost CDP/Playwright-MCP
+// browser-control channel — telemetry, not portal steps. Drop those hosts so the
+// breadcrumbs that survive describe what the run was actually doing. Tune as needed.
+const CRUMB_NOISE = /datadoghq|169\.254\.|127\.0\.0\.1|localhost|\.amazonaws\.com/i;
+
+// Filter breadcrumb plumbing and collapse consecutive duplicates into "(×N)".
+function displayBreadcrumbs(crumbs: SentryBreadcrumb[]): string[] {
+  const out: string[] = [];
+  let last = "";
+  let repeat = 0;
+  const flush = () => {
+    if (last) out.push(repeat > 1 ? `${last}  (×${repeat})` : last);
+    last = "";
+    repeat = 0;
+  };
+  for (const b of crumbs) {
+    const msg = b.message ?? "";
+    if (b.category === "http" && CRUMB_NOISE.test(msg)) continue; // infra/telemetry http
+    const line = `- [${b.level ?? "?"}] ${b.category ?? ""} ${msg}`.trimEnd();
+    if (line === last) { repeat++; continue; }
+    flush();
+    last = line;
+    repeat = 1;
+  }
+  flush();
+  return out;
+}
+
+// Render ONE aggregated block for a Sentry issue (a deduplicated error signature).
+// Every event of an issue shares the same title/stack/culprit, so we show a
+// representative ONCE and only list what actually differs between events (invoice ids,
+// POs, hosts, timing) — collapsing N near-identical event dumps into a single block.
+function renderSentryIssue(L: string[], events: SentryEvent[]): void {
+  const sorted = [...events].sort((a, b) => String(a.timestamp ?? "").localeCompare(String(b.timestamp ?? "")));
+  const rep = sorted[sorted.length - 1]; // most recent event stands in for the group
+  const count = events.length;
+  const firstTs = sorted[0]?.timestamp;
+  const lastTs = rep?.timestamp;
+
+  // Distinct tag values across the group -> constant (shown once) vs varying (listed).
+  const seen = new Map<string, Set<string>>();
+  for (const ev of events) {
+    for (const [k, v] of Object.entries(ev.tags)) {
+      if (SENTRY_TAG_DROP.has(k)) continue;
+      let set = seen.get(k);
+      if (!set) { set = new Set(); seen.set(k, set); }
+      set.add(String(v));
+    }
+  }
+  const constant = new Map<string, string>();
+  const varying = new Map<string, string[]>();
+  for (const [k, set] of seen) {
+    if (set.size === 1) constant.set(k, [...set][0]);
+    else varying.set(k, [...set]);
+  }
+
+  L.push("");
+  L.push(`#### ${rep.title ?? "(no title)"}  \`${rep.level ?? "?"}\`${count > 1 ? `  ×${count}` : ""}`);
+  const when = firstTs && lastTs && firstTs !== lastTs ? `${firstTs} → ${lastTs}` : (lastTs ?? "?");
+  L.push(`- ${rep.permalink ? `[issue ${rep.issueId}](${rep.permalink})` : `issue ${rep.issueId}`} · ${when}`);
+  if (rep.culprit) L.push(`- culprit: \`${rep.culprit}\``);
+
+  const env = SENTRY_ENV_TAGS.map((k) => constant.get(k)).filter(Boolean);
+  if (env.length) L.push(`- env: ${env.join(" · ")}`);
+  const otherConst = [...constant.keys()].filter((k) => !SENTRY_ENV_TAGS.includes(k)).sort();
+  if (otherConst.length) L.push(`- tags: ${otherConst.map((k) => `${k}=${constant.get(k)}`).join(", ")}`);
+  if (varying.size) {
+    L.push(`- differs across the ${count} events:`);
+    for (const k of [...varying.keys()].sort()) {
+      const vals = varying.get(k)!;
+      L.push(`  - ${k}: ${vals.slice(0, 6).join(", ")}${vals.length > 6 ? ` (+${vals.length - 6} more)` : ""}`);
+    }
+  }
+
+  if (rep.frames.length) {
+    L.push("- stack:");
+    L.push("  ```");
+    for (const f of rep.frames) {
+      L.push(`  at ${f.function ?? "?"} (${f.filename ?? "?"}:${f.lineNo ?? "?"})${f.contextLine ? `  | ${f.contextLine}` : ""}`);
+    }
+    L.push("  ```");
+  }
+  const crumbs = displayBreadcrumbs(rep.breadcrumbs);
+  if (crumbs.length) {
+    L.push(`- breadcrumbs${count > 1 ? " (latest event)" : ""}:`);
+    for (const c of crumbs) L.push(`  ${c}`);
+  }
+}
+
 export function renderContextMarkdown(ctx: JobContext): string {
   const L: string[] = [];
   L.push(`# Debug context — upload job ${ctx.uploadJobId}`);
@@ -716,39 +819,32 @@ export function renderContextMarkdown(ctx: JobContext): string {
   L.push("## Sentry");
   for (const s of ctx.sentry) {
     L.push("");
-    L.push(`### Project \`${s.project}\` (query: \`${s.query}\`)`);
     if (s.error) {
+      L.push(`### Project \`${s.project}\` (query: \`${s.query}\`)`);
       L.push(`_Fetch error: ${s.error}_`);
       continue;
     }
     if (!s.events.length) {
+      L.push(`### Project \`${s.project}\` (query: \`${s.query}\`)`);
       L.push("_No matching Sentry events._");
       continue;
     }
-    if (s.truncated) L.push("_(results truncated to configured caps)_");
+    // Group this project's events by issue (a deduplicated error) and render one
+    // aggregated block per issue instead of repeating a near-identical event dump.
+    const byIssue = new Map<string, SentryEvent[]>();
     for (const ev of s.events) {
-      L.push("");
-      L.push(`#### ${ev.title ?? "(no title)"} \`${ev.level ?? "?"}\``);
-      L.push(`- event ${ev.id} · issue ${ev.issueId} · ${ev.timestamp ?? "?"}`);
-      if (ev.permalink) L.push(`- ${ev.permalink}`);
-      if (ev.culprit) L.push(`- culprit: \`${ev.culprit}\``);
-      const tagKeys = Object.keys(ev.tags);
-      if (tagKeys.length) L.push(`- tags: ${tagKeys.map((k) => `${k}=${ev.tags[k]}`).join(", ")}`);
-      if (ev.frames.length) {
-        L.push("- stack:");
-        L.push("  ```");
-        for (const f of ev.frames) {
-          L.push(`  at ${f.function ?? "?"} (${f.filename ?? "?"}:${f.lineNo ?? "?"})${f.contextLine ? `  | ${f.contextLine}` : ""}`);
-        }
-        L.push("  ```");
-      }
-      if (ev.breadcrumbs.length) {
-        L.push("- breadcrumbs:");
-        for (const b of ev.breadcrumbs) {
-          L.push(`  - [${b.level ?? "?"}] ${b.category ?? ""} ${b.message ?? ""}`.trimEnd());
-        }
-      }
+      const key = ev.issueId ?? "?";
+      let g = byIssue.get(key);
+      if (!g) { g = []; byIssue.set(key, g); }
+      g.push(ev);
     }
+    const nEv = s.events.length;
+    const nIss = byIssue.size;
+    L.push(
+      `### Project \`${s.project}\` — query \`${s.query}\` · ${nEv} event${nEv === 1 ? "" : "s"}, ` +
+        `${nIss} issue${nIss === 1 ? "" : "s"}${s.truncated ? " _(truncated to caps)_" : ""}`,
+    );
+    for (const group of byIssue.values()) renderSentryIssue(L, group);
   }
   L.push("");
   return L.join("\n");
