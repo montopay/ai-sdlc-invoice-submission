@@ -244,8 +244,9 @@ test("normalizeSentryEvent tolerates an event with no entries", () => {
 function fakeGet(calls: string[]) {
   return async (path: string) => {
     calls.push(path);
-    if (path.includes("/issues/?") || (path.includes("/issues/") && path.includes("query="))) {
-      // issue search
+    if (path.includes("/issues/?")) {
+      // issue search (issues collection endpoint; the per-issue events call also
+      // carries query= now, so route by the /issues/? collection path only)
       return [
         { id: "9001", title: "Timeout", culprit: "upload", level: "error", permalink: "https://s/issues/9001/" },
       ];
@@ -289,7 +290,7 @@ test("fetchSentryForJob isolates a per-project failure instead of throwing", asy
 test("fetchSentryForJob caps events per issue and flags truncation", async () => {
   const cfg3: FetchConfig = { ...CFG, sentry: { ...CFG.sentry, maxIssues: 1, maxEventsPerIssue: 1 } };
   const get = async (path: string) => {
-    if (path.includes("/issues/?") || path.includes("query=")) {
+    if (path.includes("/issues/?")) {
       // return MORE issues than maxIssues to force truncation
       return [
         { id: "1", permalink: "p1" },
@@ -315,7 +316,7 @@ test("fetchSentryForJob reports truncated=false when results are under the caps"
 test("fetchSentryForJob flags truncation when an issue exceeds the per-issue event cap", async () => {
   const cfg: FetchConfig = { ...CFG, sentry: { ...CFG.sentry, maxIssues: 25, maxEventsPerIssue: 1 } };
   const get = async (path: string) => {
-    if (path.includes("/issues/?") || path.includes("query=")) {
+    if (path.includes("/issues/?")) {
       return [{ id: "1", permalink: "p1" }]; // 1 issue, well under maxIssues
     }
     if (path.match(/\/issues\/\d+\/events\/\?/)) {
@@ -326,6 +327,37 @@ test("fetchSentryForJob flags truncation when an issue exceeds the per-issue eve
   const ctxs = await fetchSentryForJob(VALID_ID, cfg, get);
   assert.equal(ctxs[0].truncated, true, "per-issue event cap must set truncated");
   assert.equal(ctxs[0].events.length, 1);
+});
+
+test("fetchSentryForJob keeps only events whose uploadJobId tag matches the job id", async () => {
+  // The issue-events endpoint is issue-scoped: an issue holds events from MANY jobs.
+  // With a tag-scoped template, the per-issue events call must be job-scoped (carry
+  // query=) AND only the event whose uploadJobId tag equals the input id may survive.
+  const cfg: FetchConfig = { ...CFG, sentry: { ...CFG.sentry, queryTemplate: "uploadJobId:{id}" } };
+  const OTHER_ID = "6a00000000000000000000ff";
+  const tagged = (eventID: string, jobId: string) => ({
+    ...RAW_EVENT_DETAIL,
+    eventID,
+    tags: [{ key: "level", value: "error" }, { key: "uploadJobId", value: jobId }],
+  });
+  const calls: string[] = [];
+  const get = async (path: string) => {
+    calls.push(path);
+    if (path.includes("/issues/?")) return [{ id: "9001", permalink: "p" }];
+    if (path.match(/\/issues\/\d+\/events\/\?/)) return [{ eventID: "match" }, { eventID: "other" }];
+    if (path.endsWith("/match/")) return tagged("match", VALID_ID);
+    if (path.endsWith("/other/")) return tagged("other", OTHER_ID);
+    throw new Error(`unexpected path ${path}`);
+  };
+  const ctxs = await fetchSentryForJob(VALID_ID, cfg, get);
+  // the per-issue events request must be job-scoped (carry the tag query)
+  const evReq = calls.find((p) => /\/issues\/\d+\/events\/\?/.test(p))!;
+  assert.match(evReq, /query=/, "events request must be job-scoped");
+  assert.ok(evReq.includes(encodeURIComponent(`uploadJobId:${VALID_ID}`)));
+  // only the matching-tag event survives; the other job's event is dropped
+  assert.equal(ctxs[0].events.length, 1);
+  assert.equal(ctxs[0].events[0].id, "match");
+  assert.equal(ctxs[0].events[0].tags.uploadJobId, VALID_ID);
 });
 
 // ---------------------------------------------------------------------------
