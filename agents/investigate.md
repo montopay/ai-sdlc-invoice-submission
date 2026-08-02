@@ -81,6 +81,15 @@ A single markdown block, led by a TL;DR and then exactly these sections:
    case + KB update. Only claim `no-fix` when you are sure — corroborate against the
    `page.html`/screenshot, since some "NotFound" errors are really selector drift
    (= a real code fix, `code-fix (scraper)`).
+
+   **A "soft-error" fix is not a fix — don't spec one.** If the root cause is a
+   data/config problem (a bad or incomplete input the automation itself cannot fix —
+   e.g. a required field the payload never supplied, or a field the portal can't
+   fulfil), do NOT propose a code change whose only effect is to make the failure
+   clearer, typed, or fail faster: it does not let the job succeed, so it is churn on a
+   data problem. Emit the appropriate `no-fix` verdict and flag the human who owns the
+   data/config. Reserve `code-fix` for when the automation code itself is what's wrong
+   (a control that was present and fillable, but the scraper failed to operate it).
 2. **Root cause** — what failed and why in the running automation. Cite the
    evidence: the Sentry error + the specific stack frame / source line, what the
    error screenshot / `page.html` shows, and whether a prior Case matches. Name the

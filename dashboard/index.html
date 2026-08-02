@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SDLC Pipeline Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -891,7 +892,7 @@ function renderGates() {
   return `<div style="padding:20px 22px 40px;animation:sdlcFade .25s ease">
     <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px">
       <h1 style="margin:0;font-size:17px;font-weight:600;white-space:nowrap">Gate results</h1>
-      <span style="font-size:12px;color:#5c6773">the review gate — a [BLOCKER] finding belts work back to implement</span>
+      <span style="font-size:12px;color:#5c6773">the review gate re-runs the reproduction — NOT-FIXED belts back to implement, INCONCLUSIVE stops for a human</span>
     </div>
     <div style="display:flex;flex-direction:column;gap:11px">${cards}</div>
   </div>`;
@@ -1024,7 +1025,7 @@ function renderApproval(sel, stage) {
       loadPreview(promptId, req.previewPath).then(rerender);
       previewHtml = `<div style="padding:18px;text-align:center;color:#5c6773;font-size:12px">loading preview…</div>`;
     } else if (pv) {
-      previewHtml = `<div style="max-height:280px;overflow:auto;padding:2px 4px 6px">${parseMd(pv)}</div>`;
+      previewHtml = `<div style="max-height:56vh;overflow:auto;padding:2px 4px 6px">${parseMd(pv)}</div>`;
     }
   }
 
@@ -1318,12 +1319,21 @@ function renderStageModal(sel) {
     return `<button data-act="modal-tab" data-tab="${key}" style="padding:9px 14px;border:none;border-bottom:2px solid ${active ? ACCENT : 'transparent'};background:none;cursor:pointer;font-size:12.5px;white-space:nowrap;color:${active ? '#e6edf3' : '#8b98a5'};font-weight:${active ? 600 : 400}">${esc(text)}</button>`;
   };
 
-  return `<div data-act="modal-close" style="position:fixed;inset:0;z-index:120;background:rgba(6,9,13,.66);display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px 16px">
-    <div data-act="modal-stop" style="position:relative;width:760px;max-width:calc(100vw - 32px);max-height:88vh;display:flex;flex-direction:column;background:#0e1218;border:1px solid #1c232c;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6);animation:sdlcFade .16s ease">
-      <div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid #1c232c">
+  // Which Claude model this stage runs on (per-stage config; blank = the CLI default).
+  // Only the agent stages have a model — reproduce runs the scraper, qa is deterministic.
+  const runsAgent = !['reproduce', 'qa'].includes(stageKey);
+  const stageModel = (config && config.stages && config.stages[stageKey] && config.stages[stageKey].model) || 'default';
+  const modelChip = runsAgent
+    ? `<span title="Claude model this stage runs on" style="font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;color:#c084fc;background:#1e1630;border:1px solid #3a2a55;border-radius:5px;padding:1px 8px;white-space:nowrap">model: ${esc(stageModel)}</span>`
+    : '';
+
+  return `<div data-act="modal-close" style="position:fixed;inset:0;z-index:120;background:rgba(6,9,13,.66);display:flex;align-items:flex-start;justify-content:center;padding:4vh 16px 16px">
+    <div data-act="modal-stop" style="position:relative;width:min(1080px, 94vw);max-height:92vh;display:flex;flex-direction:column;background:#0e1218;border:1px solid #1c232c;border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.6);animation:sdlcFade .16s ease">
+      <div style="display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid #1c232c;flex-wrap:wrap">
         <span style="width:10px;height:10px;border-radius:50%;background:${scol};flex:0 0 auto;animation:${dotAnim(st.state)}"></span>
         <span style="font-size:15px;font-weight:600;color:#f0f5fa">${esc(label)}</span>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-left:4px">${meta}</div>
+        ${modelChip}
         <span style="flex:1"></span>
         <button data-act="modal-close" title="Close (Esc)" style="background:none;border:none;color:#5c6773;font-size:22px;line-height:1;cursor:pointer;padding:0 4px">×</button>
       </div>
@@ -1331,7 +1341,7 @@ function renderStageModal(sel) {
         ${tabBtn('output', 'Output')}
         ${tabBtn('kb', 'Knowledge base')}
       </div>
-      <div style="padding:16px 20px;overflow:auto;font-size:13px;line-height:1.6">${body}</div>
+      <div style="flex:1;min-height:0;padding:16px 20px;overflow:auto;font-size:13.5px;line-height:1.65">${body}</div>
     </div>
   </div>`;
 }

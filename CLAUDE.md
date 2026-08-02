@@ -56,9 +56,15 @@ deterministic step, not a stage). Order and the auto-resume logic both walk
 - **implement** — writes real code in the product repo. Gated by the
   product's deterministic `check` (syntax only). Self-corrects against
   syntax up to a cap.
-- **review** — reads the spec + code, writes findings to `reviews/<id>.md`.
-  A hard gate: the deterministic `checkReview` scans for `[BLOCKER]` bullets;
-  any blocker belts back to implement (bounded), then a human.
+- **review** — empirical fix verification. The orchestrator RE-RUNS the
+  reproduction against the fix (implement left it on `feature/<id>`; the scraper
+  runs from source via `reproduce.cwd == productPath`, no build) and an agent
+  judges the outcome, writing `reviews/<id>.md` led by `Verdict: FIXED |
+  NOT-FIXED | INCONCLUSIVE`. A hard gate, `checkVerification`, reads only that
+  verdict: FIXED passes; NOT-FIXED belts back to implement (bounded, then a
+  human) with the verdict as the fix brief; INCONCLUSIVE (the reproduction
+  couldn't confirm — a setup crash, or a prod-only failure) stops for a human.
+  Needs the portal password (reused in-memory from the reproduce stage).
 - **test** — writes E2E scenarios in the product repo, each tagged
   `// COVERS: AC-N`.
 - **qa** — the authoritative gate, now fully deterministic (no agent). The
@@ -74,15 +80,18 @@ deterministic step, not a stage). Order and the auto-resume logic both walk
   the product repo, on the feature branch.
 - **Model proposes, script decides.** Agents never gate themselves: the
   orchestrator runs the checks (agents have no Bash access at all, since
-  Claude Code's sandbox can silently block a tool call). `checkReview`
-  and `checkCoverage` read files the model was not allowed to write.
+  Claude Code's sandbox can silently block a tool call). The review agent can't
+  run the reproduction either — the orchestrator runs it and hands over the
+  result; the agent only writes a verdict. `checkVerification` and
+  `checkCoverage` read files the model was not allowed to write.
 - **Gate failures route to the stage that owns the fix.** A failing E2E test
-  or a `[BLOCKER]` review finding → implement (fix the code, with the failure
-  threaded in). A coverage gap → test (add the missing tagged test). A failing
-  test is never routed back to "make it pass". An infra-failure (harness didn't
-  come up) retries the gate, never an agent, then escalates to a human. Each
-  belt is bounded, and a belt to a disabled stage (`enabled:false`) stops for a
-  human instead.
+  or a `NOT-FIXED` verification verdict → implement (fix the code, with the
+  failure/verdict threaded in). A coverage gap → test (add the missing tagged
+  test). A failing test is never routed back to "make it pass". An infra-failure
+  (harness didn't come up) retries the gate, never an agent, then escalates to a
+  human; an `INCONCLUSIVE` verification (the reproduction couldn't decide) also
+  stops for a human — never a silent pass. Each belt is bounded, and a belt to a
+  disabled stage (`enabled:false`) stops for a human instead.
 - **Role prompts stay generic.** Anything product-specific comes from the
   product's own `CLAUDE.md` (loaded per run) and its `.sdlc/product.json` —
   never hardcode a product's stack, file layout, or domain into `agents/*`.

@@ -14,7 +14,11 @@ npm run sdlc reproduce <jobId>   also standalone (headed, draft-only) for re-run
 ```
 
 Stages: `reproduce(approve) → investigate(approve) → spec(approve) → implement(auto) → review(auto)`.
-`test`, `qa`, `deploy` are **off**. Learning loop (`retrospector → curator`) is **on**.
+`review` is empirical fix-verification: it RE-RUNS the reproduction against the fix and an
+agent judges `Verdict: FIXED | NOT-FIXED | INCONCLUSIVE` (NOT-FIXED belts to implement;
+INCONCLUSIVE stops for a human). It needs the portal password even if the baseline
+reproduce was declined (reused in-memory when it wasn't). On resume it re-verifies at
+`review`. `test`, `qa`, `deploy` are **off**. Learning loop (`retrospector → curator`) is **on**.
 
 ## Locked decisions
 

@@ -11,9 +11,12 @@ import { join } from "node:path";
 // "real-failure" means the code (or its coverage) is wrong — route back to the
 // stage that owns the fix. "infra-failure" means the harness itself hiccuped
 // (PocketBase never came up, a port was taken, Docker wasn't running) — retry
-// the gate, never an agent, since there's no bug to fix. Only E2E can produce
-// infra-failure; the other checks are either pass or real-failure.
-export type GateKind = "pass" | "real-failure" | "infra-failure";
+// the gate, never an agent, since there's no bug to fix. "inconclusive" means a
+// check could not decide either way (the review verification couldn't confirm the
+// fix — the reproduction couldn't set up, or the failure never reproduces locally) —
+// stop for a human, don't belt a fix on evidence we can't trust. Only E2E produces
+// infra-failure; only review verification produces inconclusive.
+export type GateKind = "pass" | "real-failure" | "infra-failure" | "inconclusive";
 
 // Which check produced this result. The belt routes a failure to the stage
 // that OWNS the fix based on this: a failing test (e2e) or a [BLOCKER] review
@@ -168,6 +171,56 @@ export function checkReview(ticketId: string): GateResult {
     };
   }
   return { passed: true, output: "No blocking findings.", kind: "pass", source: "review" };
+}
+
+// The reworked `review` stage re-runs the reproduction against the fix and has an
+// agent lead its report with `Verdict: FIXED | NOT-FIXED | INCONCLUSIVE`. Anchored
+// like the [BLOCKER] regexes so a prose mention never triggers; NOT-FIXED and
+// INCONCLUSIVE are matched BEFORE FIXED so "NOT-FIXED" can never read as "FIXED".
+const VERDICT_LINE = /^[ \t]*(?:[-*][ \t]+)?\*{0,2}[ \t]*Verdict[ \t]*\*{0,2}[ \t]*:[ \t]*\*{0,2}[ \t]*(NOT[-\s]?FIXED|INCONCLUSIVE|FIXED)\b/i;
+
+function extractVerdict(md: string): "FIXED" | "NOT-FIXED" | "INCONCLUSIVE" | null {
+  const found = new Set<"FIXED" | "NOT-FIXED" | "INCONCLUSIVE">();
+  for (const line of md.split("\n")) {
+    const m = line.match(VERDICT_LINE);
+    if (!m) continue;
+    const v = m[1].toUpperCase().replace(/\s/g, "-");
+    found.add(v === "FIXED" ? "FIXED" : v === "INCONCLUSIVE" ? "INCONCLUSIVE" : "NOT-FIXED");
+  }
+  if (found.size === 0) return null; // no verdict -> caller treats as inconclusive
+  if (found.size > 1) return "INCONCLUSIVE"; // conflicting verdicts -> a human decides
+  return [...found][0];
+}
+
+// Deterministic gate for the fix-verification review. The orchestrator re-ran the
+// reproduction and the agent wrote reviews/<id>.md; this dumb script reads only the
+// tagged verdict and decides. Conservative in the SAFE direction (the inverse of
+// checkReview): only an explicit FIXED passes; a NOT-FIXED belts implement (with the
+// full report as the fix brief); anything else — INCONCLUSIVE, a missing/unreadable
+// verdict, or no report at all — is inconclusive and stops for a human. It never
+// passes an unverified fix and never belts a fix on a reproduction it can't trust.
+export function checkVerification(ticketId: string): GateResult {
+  const path = `reviews/${ticketId}.md`;
+  if (!existsSync(path)) {
+    return { passed: false, output: `No verification report at ${path} — cannot confirm the fix.`, kind: "inconclusive", source: "review" };
+  }
+  const md = readFileSync(path, "utf8");
+  const verdict = extractVerdict(md);
+  if (verdict === "FIXED") {
+    return { passed: true, output: "Verdict: FIXED — the reproduction no longer shows the original failure.", kind: "pass", source: "review" };
+  }
+  if (verdict === "NOT-FIXED") {
+    return { passed: false, output: md.trim(), kind: "real-failure", source: "review" };
+  }
+  return {
+    passed: false,
+    output:
+      verdict === "INCONCLUSIVE"
+        ? md.trim()
+        : `No recognizable "Verdict:" line in ${path} — treating as inconclusive.\n\n${md.trim()}`,
+    kind: "inconclusive",
+    source: "review",
+  };
 }
 
 // Recursively collect files under dir whose name matches the test pattern.

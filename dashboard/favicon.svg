@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Monto AI">
+  <title>Monto AI</title>
+  <defs>
+    <linearGradient id="montoAI" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#4f9dff"/>
+    </linearGradient>
+  </defs>
+  <!-- Brand tile: the cyan->blue gradient rounded square from the dashboard header mark -->
+  <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#montoAI)"/>
+  <!-- Monto "M" -->
+  <path d="M7.5 23.5 V12 L16 19 L24.5 12 V23.5" fill="none" stroke="#06121a"
+        stroke-width="3.7" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- AI spark, floating just above the right peak -->
+  <path d="M24.8 3 Q24.8 6.2 28 6.2 Q24.8 6.2 24.8 9.4 Q24.8 6.2 21.6 6.2 Q24.8 6.2 24.8 3 Z"
+        fill="#f0f9ff"/>
+</svg>

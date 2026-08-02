@@ -20,7 +20,7 @@ import { resolve, relative, sep, isAbsolute } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { randomUUID } from "node:crypto";
-import { runChecks, runE2E, GateResult, checkReview, checkCoverage } from "./gates";
+import { runChecks, runE2E, GateResult, checkVerification, checkCoverage } from "./gates";
 import { checkBundle, PRODUCT_KB_SPEC } from "./kb-conformance";
 import {
   fetchUploadJobContext,
@@ -40,7 +40,7 @@ type Config = {
   project: ProjectConfig;
   // enabled defaults to true when omitted; enabled:false skips the stage
   // entirely (no agent, no gate) — see runNamedStage.
-  stages: Record<string, { mode: StageMode; maxTurns?: number; enabled?: boolean }>;
+  stages: Record<string, { mode: StageMode; maxTurns?: number; enabled?: boolean; model?: string }>;
   // Optional post-ticket learning loop (Retrospector, then Curators). Off by
   // omission so the writing flow runs standalone on a fork that hasn't opted in.
   learning?: { enabled: boolean };
@@ -99,6 +99,11 @@ type Ctx = {
   // approval request.json so the dashboard/derive can scope approvals to the live
   // run and the startup sweep can discard stale ones from prior runs.
   runId: string;
+  // The portal password, collected once (reproduce stage) and reused in-memory for
+  // the review stage's verification re-run so the operator isn't prompted twice.
+  // TRANSIENT: ctx is never serialized, and this value never reaches an event, the
+  // runlog, or a log file — its only egress is the scraper child's INPUT env.
+  portalPassword?: string;
 };
 
 type RetryContext = { priorAttempt: string; feedback: string };
@@ -201,6 +206,34 @@ function readInvestigateContext(id: string): string {
   const reproPath = `context/${id}/reproduce.md`;
   if (existsSync(reproPath)) out += "\n\n---\n\n" + readFileSync(reproPath, "utf8");
   return out;
+}
+
+// The verify (review) stage's input: the original failure evidence + the spec that was
+// implemented + BOTH reproductions (the pre-fix baseline if one was captured, and the
+// post-fix re-run) so the agent can judge whether the fix resolved the failure. Assembled
+// from files like readInvestigateContext; missing pieces are labelled, not fatal, so the
+// judge can still return INCONCLUSIVE rather than the stage crashing.
+function readVerifyInput(id: string): string {
+  const parts: string[] = [];
+  const ctxPath = `context/${id}/context.md`;
+  parts.push(
+    "## Original failure (Sentry + Mongo context)\n\n" +
+      (existsSync(ctxPath) ? readFileSync(ctxPath, "utf8") : "_No fetched context.md — the original failure evidence is unavailable._"),
+  );
+  parts.push("## Spec that was implemented\n\n" + readSpec(id));
+  const beforePath = `context/${id}/reproduce.md`;
+  parts.push(
+    "## Reproduction BEFORE the fix (baseline)\n\n" +
+      (existsSync(beforePath)
+        ? readFileSync(beforePath, "utf8")
+        : "_No baseline reproduction was captured (the reproduce stage was skipped or declined)._"),
+  );
+  const afterPath = `context/${id}/reproduce.after.md`;
+  parts.push(
+    "## Reproduction AFTER the fix (re-run against the new code on feature/" + id + ")\n\n" +
+      (existsSync(afterPath) ? readFileSync(afterPath, "utf8") : "_No post-fix reproduction artifact — treat as INCONCLUSIVE._"),
+  );
+  return parts.join("\n\n---\n\n");
 }
 
 // investigate's approved output (root cause + remediation acceptance criteria) is
@@ -357,7 +390,7 @@ function quoteCommandLine(parts: string[]): string {
 // retrying a tool call it has no permission for (or just exploring
 // indefinitely) hangs the pipeline forever with no way to tell it apart
 // from a slow-but-fine run.
-const AGENT_TIMEOUT_MS = 10 * 60 * 1000;
+const AGENT_TIMEOUT_MS = 20 * 60 * 1000;
 
 // Kills the whole process tree, not just the immediate child. On Windows
 // the claude CLI runs under `shell: true` (cmd.exe wrapping claude.cmd
@@ -441,6 +474,10 @@ function callAgent(
     cwd: string;
     allowedTools?: string[];
     maxTurns?: number;
+    // Claude model for this agent (a `claude --model` value, e.g. "opus" or a full
+    // id). When unset, the CLI's default model is used. Set per-stage via
+    // sdlc.config.json stages[<stage>].model (see modelForStage).
+    model?: string;
     addDir?: string;
     // Additional readable roots beyond addDir (each becomes another --add-dir).
     // addDir stays the KB dir (kb_read telemetry keys on it); extraDirs are e.g.
@@ -476,12 +513,15 @@ function callAgent(
   const mcpArgs = opts?.mcpConfig
     ? ["--mcp-config", opts.mcpConfig, "--strict-mcp-config"]
     : [];
+  // Per-stage model override (e.g. a stronger model for investigate). Woven in HERE
+  // with dirArgs/mcpArgs, before the win32/POSIX fork, so it's quoted on Windows.
+  const modelArgs = opts?.model ? ["--model", opts.model] : [];
   // stream-json emits one JSON event per line (assistant/tool_use/result/…);
   // the CLI rejects it in --print mode without --verbose.
   const streamArgs = ["--output-format", "stream-json", "--verbose"];
   const args = opts?.allowedTools
-    ? [...dirArgs, ...mcpArgs, "--allowedTools", opts.allowedTools.join(","), ...streamArgs, "-p"]
-    : [...dirArgs, ...mcpArgs, ...streamArgs, "-p"];
+    ? [...dirArgs, ...mcpArgs, ...modelArgs, "--allowedTools", opts.allowedTools.join(","), ...streamArgs, "-p"]
+    : [...dirArgs, ...mcpArgs, ...modelArgs, ...streamArgs, "-p"];
 
   const kbDir = opts.addDir;
 
@@ -1036,6 +1076,7 @@ async function runStage(opts: StageOptions, ctx: Ctx, retry?: RetryContext, atte
   const output = await callAgent(prompt, {
     cwd: ctx.paths.workdir,
     allowedTools: opts.allowedTools ? [...opts.allowedTools, ...mcp.tools] : opts.allowedTools,
+    model: modelForStage(ctx, opts.stage),
     addDir: kb ? kb.dir : undefined,
     extraDirs: opts.extraReadDirs,
     mcpConfig: mcp.mcpConfig,
@@ -1270,6 +1311,7 @@ async function runStageImplement(
       cwd: ctx.paths.workdir,
       allowedTools: ["Read", "Edit", "Write", ...mcp.tools],
       maxTurns,
+      model: modelForStage(ctx, "implement"),
       addDir: kb ? kb.dir : undefined,
       mcpConfig: mcp.mcpConfig,
       ticket: ticketId,
@@ -1323,20 +1365,20 @@ function writeReview(ticketId: string, output: string): void {
   writeFileSync(`reviews/${ticketId}.md`, output);
 }
 
-// Review is now a GATED, belted stage — not a plain runStage. The agent writes
-// findings; a deterministic script (checkReview) decides whether any are
-// [BLOCKER]. A blocker means the CODE is wrong, so the belt routes to IMPLEMENT
-// with the blocker text as the fix brief, then review re-runs — capped at
-// MAX_REVIEW_ATTEMPTS, then a human. It doesn't fit runStage() for the same
-// reason implement/qa don't: its gate is a script, and a failing gate isn't the
-// review agent's own to fix.
+// Review is an EMPIRICAL fix-verification stage, not a static code review. It re-runs
+// the reproduction against the fix (implement left it on feature/<id>) and an agent
+// judges the outcome, writing reviews/<id>.md led by `Verdict: FIXED|NOT-FIXED|
+// INCONCLUSIVE`. A deterministic script (checkVerification) reads only that verdict and
+// routes: FIXED -> pass; NOT-FIXED -> belt to IMPLEMENT with the verdict as the fix
+// brief, then re-verify (capped at MAX_REVIEW_ATTEMPTS, then a human); INCONCLUSIVE (or
+// a reproduction that couldn't even run) -> stop for a human immediately. Same "model
+// proposes, script decides" shape as the old [BLOCKER] gate — the orchestrator runs the
+// reproduction (agents have no Bash) and the agent only proposes a verdict.
 //
-// mode governs ONLY the human pause on the review TEXT (approve => y/n before
-// the gate; reject re-runs the agent in place with feedback). The [BLOCKER] gate
-// runs regardless of mode, exactly like implement's syntax gate and QA's E2E
-// gate — a deterministic gate is not something a mode can switch off.
+// mode is retained for telemetry only; the verification runs the same way regardless
+// (the reproduction is inherently interactive — it needs the portal password, reused
+// in-memory from the reproduce stage).
 async function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Promise<void> {
-  const spec = readSpec(ticketId);
   const kb = readKbIndex(ctx.paths.knowledgeDir);
   const mcp = mcpForStage(ctx, "review");
 
@@ -1344,46 +1386,62 @@ async function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Prom
     const startedAt = Date.now();
     emitEvent("stage_started", { ticket: ticketId, stage: "review", attempt, mode });
 
-    // Produce findings (agent), with the approve-mode human loop. A human reject
-    // re-runs the agent in place (unbounded — a person is present), same as
-    // runStage's reject loop; it does not consume a belt attempt.
-    let retry: RetryContext | undefined;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const prompt = buildPrompt(ctx.paths.workdir, "agents/review.md", spec, retry, kb);
+    // (1) Re-run the reproduction against the FIX, then (2) have the agent judge it. Any
+    // failure of the reproduction/setup itself (missing cwd, aborted password, the scraper
+    // won't launch, an exit-1 setup crash) is INCONCLUSIVE — a human must decide; we never
+    // silently pass or belt implement on a reproduction we can't trust.
+    try {
+      // The fix lives on feature/<ticketId>. doReproduce runs in config.reproduce.cwd,
+      // which MUST be the same working tree implement edited or we'd verify the wrong code.
+      const reproCwd = resolve(ctx.config.reproduce?.cwd ?? ctx.paths.workdir);
+      if (reproCwd !== resolve(ctx.paths.workdir)) {
+        throw new Error(
+          `reproduce.cwd (${reproCwd}) is not the product repo implement edits (${resolve(ctx.paths.workdir)}) — ` +
+            `cannot verify the fix by reproducing. Point reproduce.cwd at project.productPath.`,
+        );
+      }
+      ensureBranch(ticketId, reproCwd); // idempotent — implement already left feature/<id> checked out
+      emitEvent("stage_running", { ticket: ticketId, stage: "review", runId: ctx.runId });
+
+      const password = await getPortalPassword(ctx, ctx.config, ticketId);
+      console.log(`\nRe-running the reproduction against the fix for ticket ${ticketId} (attempt ${attempt}/${MAX_REVIEW_ATTEMPTS})...\n`);
+      const { exitCode } = await doReproduce(ticketId, ctx.config, { runId: ctx.runId, password, outFile: "reproduce.after.md" });
+      console.log(`\nreproduce (post-fix): exit ${exitCode} → context/${ticketId}/reproduce.after.md`);
+
+      // The judge: a READ-ONLY agent compares the before/after reproductions against the
+      // original failure + spec and writes the tagged verdict. No retry/RetryContext — it's
+      // a one-shot judgment, and the belt (below) re-runs the whole verification.
+      const prompt = buildPrompt(ctx.paths.workdir, "agents/review.md", readVerifyInput(ticketId), undefined, kb);
       emitEvent("agent_started", { ticket: ticketId, stage: "review", kb: { offered: !!kb, dir: kb ? kb.dir : undefined } });
-      console.log(`\nRunning review agent on ticket ${ticketId} (attempt ${attempt}/${MAX_REVIEW_ATTEMPTS})...\n`);
+      console.log(`\nRunning the verification judge on ticket ${ticketId}...\n`);
       const output = await callAgent(prompt, {
         cwd: ctx.paths.workdir,
         allowedTools: ["Read", ...mcp.tools],
+        model: modelForStage(ctx, "review"),
         addDir: kb ? kb.dir : undefined,
+        extraDirs: [resolve(`context/${ticketId}`)],
         mcpConfig: mcp.mcpConfig,
         ticket: ticketId,
         stage: "review",
       });
-      console.log(`----- review agent output -----\n`);
+      console.log(`----- verification verdict -----\n`);
       console.log(output);
-      console.log("\n-------------------------------\n");
+      console.log("\n--------------------------------\n");
       writeReview(ticketId, output);
-
-      if (mode !== "approve") break;
-      // Review's artifact IS persisted (reviews/<id>.md, just written) — so the
-      // dashboard previews that path directly and NO approvals preview.md is
-      // written. Pass the real belt attempt so the UI can attribute the pause.
-      const decision = await awaitApproval(ctx, {
-        ticket: ticketId,
-        stage: "review",
-        attempt,
-        question: "Approve this review?",
-        previewPath: `reviews/${ticketId}.md`,
-        wantFeedback: true,
-      });
-      if (decision.approved) break;
-      retry = { priorAttempt: output, feedback: decision.feedback ?? "" };
+    } catch (err) {
+      // The reproduction or judge could not run -> INCONCLUSIVE. Write the verdict file so
+      // checkVerification routes it (human stop), the dashboard shows it, and resume is clean.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`review: verification could not run (${msg}) — recording INCONCLUSIVE.`);
+      writeReview(
+        ticketId,
+        `# Fix verification — upload job ${ticketId}\n\n_Ran ${new Date().toISOString()}_\n\n` +
+          `Verdict: INCONCLUSIVE\n\n**Reason:** the reproduction could not run, so the fix could not be verified: ${msg}\n`,
+      );
     }
 
-    // Deterministic blocker gate — runs regardless of mode.
-    const gate = checkReview(ticketId);
+    // Deterministic gate — reads only the tagged verdict from reviews/<id>.md.
+    const gate = checkVerification(ticketId);
     logRun({
       stage: "review",
       ticket: ticketId,
@@ -1397,41 +1455,49 @@ async function runStageReview(ticketId: string, mode: StageMode, ctx: Ctx): Prom
     emitEvent("gate_result", { ticket: ticketId, stage: "review", source: gate.source, kind: gate.kind, passed: gate.passed, attempt });
 
     if (gate.passed) {
-      console.log("Review gate passed (no blocking findings).");
+      console.log("Verification passed — the fix resolves the reproduction (Verdict: FIXED).");
       emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: true, durationMs: Date.now() - startedAt, attempt });
       return;
     }
 
-    if (attempt >= MAX_REVIEW_ATTEMPTS) break;
-
-    // A [BLOCKER] is the CODE's problem -> implement owns the fix. Honor the
-    // enabled flag: if implement is off, the pipeline can't auto-fix, so stop
-    // for a human (mirror of QA's belt guard).
-    if (!stageEnabled(ctx, "implement")) {
-      console.log("Review found blockers but implement is disabled (enabled:false) — stopping for a human.");
-      emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "belt-target-disabled", beltTarget: "implement", attempt });
+    // INCONCLUSIVE -> a human must judge. Do NOT belt implement and do NOT retry: re-running
+    // won't resolve an outcome we can't interpret, and it's expensive + interactive.
+    if (gate.kind === "inconclusive") {
+      emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "inconclusive", attempt });
       throw new Error(
-        `Review found [BLOCKER] finding(s) for ticket ${ticketId} that the implement stage owns, but implement ` +
-          `is disabled (enabled:false) in sdlc.config.json — the pipeline will not run a stage you turned off. ` +
-          `Re-enable implement (or resolve by hand), then re-run review.\n\n${gate.output}`
+        `Review could not verify the fix for ticket ${ticketId} (INCONCLUSIVE). See reviews/${ticketId}.md and ` +
+          `context/${ticketId}/reproduce.after.md — a human must judge (the reproduction couldn't confirm the failure: ` +
+          `e.g. a setup crash, or a prod-only failure that doesn't reproduce locally).`,
       );
     }
-    console.log("Review found BLOCKER(s). Re-running the IMPLEMENT stage with the blocker details, then re-reviewing.");
-    emitEvent("belt_route", { ticket: ticketId, from: "review", to: "implement", reason: "blocker", attempt });
+
+    // NOT-FIXED -> the CODE is still wrong -> implement owns the fix.
+    if (attempt >= MAX_REVIEW_ATTEMPTS) break;
+    if (!stageEnabled(ctx, "implement")) {
+      console.log("Verification says NOT-FIXED but implement is disabled (enabled:false) — stopping for a human.");
+      emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "belt-target-disabled", beltTarget: "implement", attempt });
+      throw new Error(
+        `Verification reports the fix is NOT-FIXED for ticket ${ticketId}, which implement owns, but implement is ` +
+          `disabled (enabled:false) in sdlc.config.json. Re-enable implement (or fix by hand), then re-run review.\n\n${gate.output}`,
+      );
+    }
+    console.log("Verification: NOT-FIXED. Re-running IMPLEMENT with the verdict, then re-verifying.");
+    emitEvent("belt_route", { ticket: ticketId, from: "review", to: "implement", reason: "not-fixed", attempt });
     emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, durationMs: Date.now() - startedAt, attempt });
     await runStageImplement(
       ticketId,
       ctx.config.stages.implement?.mode ?? "auto",
       ctx,
       ctx.config.stages.implement?.maxTurns,
-      `The review stage found blocking issues. Fix the code so these are resolved (do not try to silence the reviewer):\n${gate.output}`
+      `The fix did NOT resolve the failure — the reproduction still fails. Fix the code so the reproduction gets ` +
+        `past this (do not weaken or bypass the check that fails):\n${gate.output}`,
     );
   }
 
   emitEvent("stage_finished", { ticket: ticketId, stage: "review", approved: false, reason: "exhausted", attempt: MAX_REVIEW_ATTEMPTS });
   throw new Error(
-    `Review still reports [BLOCKER] finding(s) for ticket ${ticketId} after ${MAX_REVIEW_ATTEMPTS} attempts. ` +
-      `See reviews/${ticketId}.md and inspect the branch — the pipeline does not retry further.`
+    `Verification still reports the fix is NOT-FIXED for ticket ${ticketId} after ${MAX_REVIEW_ATTEMPTS} attempts. ` +
+      `See reviews/${ticketId}.md and context/${ticketId}/reproduce.after.md — the pipeline does not retry further.`,
   );
 }
 
@@ -1676,7 +1742,7 @@ async function runStageRetrospector(ticketId: string, ctx: Ctx, failureNote?: st
   emitEvent("agent_started", { ticket: ticketId, stage: "retrospector", kb: { offered: false } });
 
   console.log(`\nRunning retrospector on ticket ${ticketId}...\n`);
-  const summary = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], ticket: ticketId, stage: "retrospector" });
+  const summary = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], model: modelForStage(ctx, "retrospector"), ticket: ticketId, stage: "retrospector" });
 
   console.log("----- retrospector summary -----\n");
   console.log(summary);
@@ -1882,7 +1948,7 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
     console.log(`\nRunning ${which} curator on ticket ${ticketId} (attempt ${attempt}/${MAX_CURATOR_ATTEMPTS})...\n`);
     // Read-only + a readable root into the KB so it can inspect existing
     // concepts (update-over-duplicate). It PROPOSES file text; it never writes.
-    const proposal = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], addDir: kbDir, ticket: ticketId, stage });
+    const proposal = await callAgent(prompt, { cwd: ctx.paths.workdir, allowedTools: ["Read"], model: modelForStage(ctx, stage), addDir: kbDir, ticket: ticketId, stage });
 
     console.log("----- curator proposal -----\n");
     console.log(proposal);
@@ -1962,6 +2028,12 @@ async function runCurator(ticketId: string, ctx: Ctx, which: "product"): Promise
 // it separately, with a different note); this only reports the explicit off.
 function stageEnabled(ctx: Ctx, stage: Stage): boolean {
   return ctx.config.stages[stage]?.enabled !== false;
+}
+
+// Optional per-stage Claude model (a `claude --model` value). Undefined => the CLI
+// default. Set via sdlc.config.json stages[<stage>].model, e.g. "opus" for investigate.
+function modelForStage(ctx: Ctx, stage: string): string | undefined {
+  return ctx.config.stages[stage]?.model;
 }
 
 // The stages that produce or act on a CODE fix. When investigate returns a "no-fix"
@@ -2176,11 +2248,45 @@ function renderReproduceMd(
   ].join("\n");
 }
 
-// Core reproduce: build a self-contained input from the Mongo step, prompt for the
-// password, run the real scraper HEADED (draft-only), and CAPTURE the result to
-// context/<id>/reproduce.md so the investigate stage can read it. Throws on setup
-// errors (missing context/creds/cwd). Returns the exit code + artifact path.
-async function doReproduce(uploadJobId: string, config: Config, opts: { runId?: string } = {}): Promise<{ exitCode: number | null; mdPath: string }> {
+// Collect the portal password interactively — the TTY prompt, or the masked dashboard
+// field when SDLC_DASHBOARD_RUN is set; never file-channelled. Throws when neither is
+// available (a non-TTY, non-dashboard run cannot collect it).
+async function collectPortalPassword(config: Config, uploadJobId: string, runId?: string): Promise<string> {
+  const passwordPrompt = config.reproduce?.passwordPrompt ?? "Portal password";
+  let password: string;
+  if (process.stdin.isTTY) {
+    password = await promptText(passwordPrompt);
+  } else if (process.env.SDLC_DASHBOARD_RUN) {
+    password = await awaitPasswordViaDashboard(uploadJobId, passwordPrompt, runId);
+  } else {
+    throw new Error(
+      "reproduce needs a TTY for the portal password — run from a terminal, use the dashboard, or set reproduce mode to skip"
+    );
+  }
+  if (!password) throw new Error("No password entered — aborting reproduce.");
+  return password;
+}
+
+// Return the run's portal password, collecting it once and caching it in-memory on ctx
+// so the reproduce stage and the review stage's verification re-run don't prompt twice.
+// The cache is an optimization: if the reproduce stage was declined, review collects
+// fresh here. Never serialized or logged (see the Ctx.portalPassword note).
+async function getPortalPassword(ctx: Ctx, config: Config, uploadJobId: string): Promise<string> {
+  if (ctx.portalPassword) return ctx.portalPassword;
+  const pw = await collectPortalPassword(config, uploadJobId, ctx.runId);
+  ctx.portalPassword = pw;
+  return pw;
+}
+
+// Core reproduce: build a self-contained input from the Mongo step, use the given
+// password (or collect one), run the real scraper HEADED (draft-only), and CAPTURE the
+// result to context/<id>/<outFile> (default reproduce.md) so a later stage can read it.
+// Throws on setup errors (missing context/creds/cwd). Returns the exit code + artifact path.
+async function doReproduce(
+  uploadJobId: string,
+  config: Config,
+  opts: { runId?: string; password?: string; outFile?: string } = {},
+): Promise<{ exitCode: number | null; mdPath: string }> {
   if (!config.reproduce) throw new Error("sdlc.config.json has no `reproduce` block (see its _comment_reproduce note).");
   if (!config.fetch) throw new Error("reproduce builds its input from the `fetch.mongo` config, which is missing.");
 
@@ -2195,25 +2301,12 @@ async function doReproduce(uploadJobId: string, config: Config, opts: { runId?: 
     throw new Error("MONGODB_URI is required in this repo's .env — reproduce builds the scraper input from the Mongo step.");
   }
 
-  // The portal password is collected interactively and NEVER file-channelled. Over a
-  // real terminal we prompt on the TTY; when the DASHBOARD launched this run (no TTY,
-  // SDLC_DASHBOARD_RUN set) we collect it over stdin via a masked dashboard field
-  // (echo off — never hits the captured log). A non-TTY run that is NEITHER is a dead
-  // end, so fail loudly. In the reproduce STAGE the surrounding try/catch turns this
-  // into "continue without reproduction" (no hang); the standalone reproduce command
-  // surfaces it as an error.
-  const passwordPrompt = config.reproduce.passwordPrompt ?? "Portal password";
-  let password: string;
-  if (process.stdin.isTTY) {
-    password = await promptText(passwordPrompt);
-  } else if (process.env.SDLC_DASHBOARD_RUN) {
-    password = await awaitPasswordViaDashboard(uploadJobId, passwordPrompt, opts.runId);
-  } else {
-    throw new Error(
-      "reproduce needs a TTY for the portal password — run from a terminal, use the dashboard, or set reproduce mode to skip"
-    );
-  }
-  if (!password) throw new Error("No password entered — aborting reproduce.");
+  // The portal password is used interactively and NEVER file-channelled: the caller may
+  // pass one it already collected (the review stage reuses the cached password), else we
+  // collect it here (TTY prompt or masked dashboard field). In the reproduce STAGE the
+  // surrounding try/catch turns a collection failure into "continue without reproduction"
+  // (no hang); the standalone reproduce command surfaces it as an error.
+  const password = opts.password ?? (await collectPortalPassword(config, uploadJobId, opts.runId));
 
   // Build a SELF-CONTAINED input from the Mongo step (the upload_jobs aggregation), so
   // the scraper does NOT re-hydrate and needs no MongoDB of its own (SKIP_MONGO).
@@ -2254,7 +2347,7 @@ async function doReproduce(uploadJobId: string, config: Config, opts: { runId?: 
   const { exitCode, output } = await spawnTee(config.reproduce.command, { cwd, env });
 
   mkdirSync(jobDir, { recursive: true });
-  const mdPath = `${jobDir}/reproduce.md`;
+  const mdPath = `${jobDir}/${opts.outFile ?? "reproduce.md"}`;
   writeFileSync(mdPath, renderReproduceMd(uploadJobId, portalName, config.reproduce.command, exitCode, output));
   return { exitCode, mdPath };
 }
@@ -2315,7 +2408,10 @@ async function runStageReproduce(ticketId: string, mode: StageMode, ctx: Ctx): P
   emitEvent("stage_running", { ticket: ticketId, stage: "reproduce", runId: ctx.runId });
 
   try {
-    const { exitCode, mdPath } = await doReproduce(ticketId, ctx.config, { runId: ctx.runId });
+    // Collect the password here (caching it on ctx) so the review stage's verification
+    // re-run can reuse it without prompting again.
+    const password = await getPortalPassword(ctx, ctx.config, ticketId);
+    const { exitCode, mdPath } = await doReproduce(ticketId, ctx.config, { runId: ctx.runId, password });
     console.log(`\nreproduce: captured → ${mdPath} (exit ${exitCode}).`);
     return finish({ ran: true, exitCode });
   } catch (err) {
