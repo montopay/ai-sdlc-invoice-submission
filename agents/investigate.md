@@ -53,7 +53,11 @@ it (your role-specific, product-specific playbook). Then scan `cases/index.md` f
 a PRIOR incident matching this portal + error signature — if one matches, open it
 and use its recorded root cause and fix. Also read the relevant
 `portals/<portal>.md`, `handlers/error-mapping.md`, and
-`handlers/selector-strategies.md`. Read only what you need.
+`handlers/selector-strategies.md`. For any field/input failure, also read
+`handlers/handler-pattern.md` + `handlers/field-catalog.md` and check whether a
+handler for the failing field exists: a required field whose control is present and
+fillable but that has **no existing handler** is a real code fix that ADDS a handler,
+not a config/data gap. Read only what you need.
 
 ## Output
 
