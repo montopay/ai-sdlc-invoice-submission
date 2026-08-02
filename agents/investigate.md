@@ -53,7 +53,13 @@ it (your role-specific, product-specific playbook). Then scan `cases/index.md` f
 a PRIOR incident matching this portal + error signature — if one matches, open it
 and use its recorded root cause and fix. Also read the relevant
 `portals/<portal>.md`, `handlers/error-mapping.md`, and
-`handlers/selector-strategies.md`. Read only what you need.
+`handlers/selector-strategies.md`. Read only what you need — **except** that when the
+failure looks like a field/input problem (a handler timing out, a form that won't
+advance, a required/missing/extra field, a "NotFound" on a form control, or suspected
+bad input) you MUST read the playbook's field/schema references
+(`handlers/error-mapping.md` and the buyer field-schema reference) before classifying
+it; the schema-gap-vs-scraper-bug call hinges on them, and skipping them is how a data
+gap gets mis-shipped as scraper code.
 
 ## Output
 
@@ -77,6 +83,15 @@ A single markdown block, led by a TL;DR and then exactly these sections:
    case + KB update. Only claim `no-fix` when you are sure — corroborate against the
    `page.html`/screenshot, since some "NotFound" errors are really selector drift
    (= a real code fix, `code-fix (scraper)`).
+
+   **A "soft-error" fix is not a fix — don't spec one.** If the root cause is a
+   data/config problem (a bad or incomplete input the automation itself cannot fix —
+   e.g. a required field the payload never supplied, or a field the portal can't
+   fulfil), do NOT propose a code change whose only effect is to make the failure
+   clearer, typed, or fail faster: it does not let the job succeed, so it is churn on a
+   data problem. Emit the appropriate `no-fix` verdict and flag the human who owns the
+   data/config. Reserve `code-fix` for when the automation code itself is what's wrong
+   (a control that was present and fillable, but the scraper failed to operate it).
 2. **Root cause** — what failed and why in the running automation. Cite the
    evidence: the Sentry error + the specific stack frame / source line, what the
    error screenshot / `page.html` shows, and whether a prior Case matches. Name the

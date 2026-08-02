@@ -15,3 +15,25 @@
 {"stage":"reproduce","ticket":"6a64b5f255c42b598e4060cd","mode":"approve","durationMs":181443,"approved":true}
 {"stage":"investigate","ticket":"6a64b5f255c42b598e4060cd","mode":"approve","durationMs":698523,"approved":true}
 {"stage":"spec","ticket":"6a64b5f255c42b598e4060cd","mode":"approve","durationMs":247144,"approved":false,"feedback":"dont touch the invoiceFile we are gonna remove this from the reproduce flow "}
+{"stage":"reproduce","ticket":"6a69bccf905335b7f01869b7","mode":"approve","durationMs":94098,"approved":true}
+{"stage":"reproduce","ticket":"6a6ae9856fd71aad776d501f","mode":"approve","durationMs":300618,"approved":true}
+{"stage":"investigate","ticket":"6a6ae9856fd71aad776d501f","mode":"approve","durationMs":1819084,"approved":true}
+{"stage":"spec","ticket":"6a6ae9856fd71aad776d501f","mode":"approve","durationMs":146817,"approved":true}
+{"stage":"implement","ticket":"6a6ae9856fd71aad776d501f","mode":"auto","branch":"feature/6a6ae9856fd71aad776d501f","attempt":1,"durationMs":265829,"approved":true,"gateKind":"pass"}
+{"stage":"review","ticket":"6a6ae9856fd71aad776d501f","mode":"auto","attempt":1,"durationMs":201626,"approved":true,"gateKind":"pass","gateSource":"review"}
+{"stage":"retrospector","ticket":"6a6ae9856fd71aad776d501f","durationMs":49918,"approved":true}
+{"stage":"retrospector","ticket":"6a6ae9856fd71aad776d501f","durationMs":46042,"approved":true}
+{"stage":"curator-product","ticket":"6a6ae9856fd71aad776d501f","durationMs":108002,"approved":true,"change":false}
+{"stage":"reproduce","ticket":"6a6b65f01c0c66a665455a70","mode":"approve","durationMs":143207,"approved":true}
+{"stage":"investigate","ticket":"6a6b65f01c0c66a665455a70","mode":"approve","durationMs":671867,"approved":true}
+{"stage":"reproduce","ticket":"6a6b9b79d3672bbb25daae6f","mode":"approve","durationMs":50109,"approved":true}
+{"stage":"investigate","ticket":"6a6b9b79d3672bbb25daae6f","mode":"approve","durationMs":458980,"approved":true}
+{"stage":"reproduce","ticket":"6a6bfd73ad8b411f0eef98d2","mode":"approve","durationMs":283329,"approved":true}
+{"stage":"reproduce","ticket":"6a6d9912b51d07a9aa727127","mode":"approve","durationMs":156465,"approved":true}
+{"stage":"investigate","ticket":"6a6d9912b51d07a9aa727127","mode":"approve","durationMs":548349,"approved":true}
+{"stage":"spec","ticket":"6a6d9912b51d07a9aa727127","mode":"approve","durationMs":217151,"approved":true}
+{"stage":"retrospector","ticket":"6a6d9912b51d07a9aa727127","durationMs":63324,"approved":true}
+{"stage":"reproduce","ticket":"6a6e137bc756e191149b424b","mode":"approve","durationMs":167745,"approved":true}
+{"stage":"investigate","ticket":"6a6e137bc756e191149b424b","mode":"approve","durationMs":783485,"approved":true}
+{"stage":"retrospector","ticket":"6a6e137bc756e191149b424b","durationMs":33510,"approved":true}
+{"stage":"curator-product","ticket":"6a6e137bc756e191149b424b","durationMs":199111,"approved":true,"change":true,"branch":"kb/6a6e137bc756e191149b424b-1785609803298-a1","pushed":true}

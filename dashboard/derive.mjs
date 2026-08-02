@@ -181,7 +181,7 @@ function deriveTicket(id, runlog, events, meta, now) {
     if (skipped && state === "todo") state = "skipped";
     if (st.planned) state = "planned"; // Deploy is never real yet
 
-    // Gate detail for this stage (implement=syntax, review=blocker, qa=e2e/coverage).
+    // Gate detail for this stage (implement=syntax, review=verify verdict, qa=e2e/coverage).
     let gateKind = null, gateSource = null;
     if (lastRl && (st.key === "implement" || st.key === "review" || st.key === "qa")) {
       gateKind = lastRl.gateKind ?? null;
@@ -222,7 +222,12 @@ function deriveTicket(id, runlog, events, meta, now) {
   const anyRunning = STAGES.some((s) => stages[s.key].state === "running");
   const anyWaiting = STAGES.some((s) => stages[s.key].state === "waiting");
   const reviewFailed = stages.review.state === "failed";
-  const blocked = reviewFailed && implAttempts >= CAP;
+  // Review is now fix-verification. It blocks (needs a human) either when the
+  // verify->implement belt is exhausted (implAttempts >= CAP) OR when the fix could
+  // not be verified at all (Verdict: INCONCLUSIVE) — that stops immediately, without
+  // belting implement, so it wouldn't otherwise trip the attempt-based check.
+  const reviewInconclusive = reviewFailed && stages.review.gateKind === "inconclusive";
+  const blocked = (reviewFailed && implAttempts >= CAP) || reviewInconclusive;
   // Terminal success = every active (enabled, non-skipped) stage has passed. With
   // test/qa disabled that means "review passed".
   const finalDone = activeStages.length > 0 && activeStages.every((s) => stages[s.key].state === "done");
@@ -328,17 +333,25 @@ function outcomeOf(status) {
 }
 
 // Build the per-gate check breakdown for a runlog gate entry: Syntax (implement),
-// Review CLEAN/BLOCKER (review), or E2E + Coverage (qa). QA is deterministic now:
-// runQaGate runs E2E then — only when the test stage is enabled — coverage, and
-// stops at the first failure, so the deciding source tells us how far it got.
+// Verify FIXED/NOT-FIXED/INCONCLUSIVE (review re-runs the reproduction and judges the
+// fix), or E2E + Coverage (qa). QA is deterministic now: runQaGate runs E2E then — only
+// when the test stage is enabled — coverage, and stops at the first failure, so the
+// deciding source tells us how far it got.
 function gateChecks(e) {
   if (e.stage === "implement") {
     const ok = e.approved === true;
     return [{ label: "Syntax", value: ok ? "PASS" : "FAIL", kind: ok ? "pass" : "fail" }];
   }
   if (e.stage === "review") {
-    const ok = e.approved === true;
-    return [{ label: "Review", value: ok ? "CLEAN" : "BLOCKER", kind: ok ? "pass" : "fail" }];
+    // Map from the verification gate's kind: pass->FIXED, inconclusive->INCONCLUSIVE
+    // (needs a human, shown amber), otherwise NOT-FIXED. Old runlog entries without a
+    // gateKind fall back to `approved`.
+    const value =
+      e.gateKind === "pass" || e.approved === true ? "FIXED"
+        : e.gateKind === "inconclusive" ? "INCONCLUSIVE"
+          : "NOT-FIXED";
+    const kind = value === "FIXED" ? "pass" : value === "INCONCLUSIVE" ? "infra" : "fail";
+    return [{ label: "Verify", value, kind }];
   }
   if (e.stage !== "qa") return null;
   const passed = e.approved === true;
@@ -395,15 +408,20 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
     .filter(Boolean)
     .slice(0, 12);
 
-  // Gate results — the REVIEW gate (a [BLOCKER] belts back to implement), one row
-  // per review attempt.
+  // Gate results — the REVIEW verification gate (re-runs the reproduction and judges the
+  // fix; NOT-FIXED belts back to implement, INCONCLUSIVE stops for a human), one row per
+  // verification attempt.
   const gateResults = [];
   for (const t of tickets) {
     t.ents.filter((e) => e.stage === "review").forEach((e) => {
+      const verdict =
+        e.gateKind === "pass" || e.approved === true ? "FIXED"
+          : e.gateKind === "inconclusive" ? "INCONCLUSIVE"
+            : "NOT-FIXED";
       gateResults.push({
         ticket: t.id, title: t.title, gate: "Review",
         attempt: e.attempt || 1,
-        verdict: e.approved === true ? "CLEAN" : "BLOCKER",
+        verdict,
         passed: e.approved === true,
         checks: gateChecks(e),
         feedback: e.feedback || "",
@@ -427,7 +445,7 @@ export function deriveModel({ runlog = [], events = [], meta = {}, now = null } 
   });
   const reviewRealFails = allEnts.filter((e) => e.stage === "review" && e.approved === false).length;
   const beltHot = [
-    { label: "Review — blockers", count: reviewRealFails, kind: "failed", sub: `caused ${totalLoops} implement re-runs` },
+    { label: "Review — not fixed", count: reviewRealFails, kind: "failed", sub: `caused ${totalLoops} implement re-runs` },
     { label: "Reproductions run", count: reproducedTickets.size, kind: "running", sub: "live headed replays" },
     { label: "Cases proposed", count: casesProposed, kind: "done", sub: "curator → KB PRs" },
   ];
