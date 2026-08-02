@@ -173,6 +173,16 @@ export function renderSentryQuery(template: string, id: string): string {
   return template.split("{id}").join(id);
 }
 
+// If the query template is a single tag filter ("<tag>:{id}", e.g. "uploadJobId:{id}"),
+// return that tag name so the fetch can VERIFY each returned event actually carries it
+// (tag === the job id). The Sentry events endpoint is issue-scoped, not job-scoped, so
+// without this check an issue's events from OTHER jobs leak in. Returns undefined for a
+// free-text template (no tag to verify).
+export function tagKeyFromTemplate(template: string): string | undefined {
+  const m = template.match(/^\s*(\w+):\{id\}\s*$/);
+  return m ? m[1] : undefined;
+}
+
 function asString(v: unknown): string | undefined {
   if (v == null) return undefined;
   if (typeof v === "string") return v;
@@ -351,6 +361,8 @@ export async function withRetry<T>(
 async function fetchSentryProject(
   project: string,
   query: string,
+  id: string,
+  tagKey: string | undefined,
   sentry: FetchConfig["sentry"],
   get: HttpGet,
 ): Promise<SentryContext> {
@@ -367,15 +379,24 @@ async function fetchSentryProject(
 
   const events: SentryEvent[] = [];
   for (const issue of issues.slice(0, sentry.maxIssues)) {
+    // Job-scope the events fetch: the same query used to find the issue, so the
+    // job's own (possibly older, buried) events are returned — not just the issue's
+    // latest N, which for a high-frequency issue belong to newer, unrelated jobs.
     const evListRaw = await get(
-      `/api/0/organizations/${sentry.org}/issues/${issue.id}/events/?limit=${sentry.maxEventsPerIssue + 1}`,
+      `/api/0/organizations/${sentry.org}/issues/${issue.id}/events/` +
+        `?query=${encodeURIComponent(query)}&limit=${sentry.maxEventsPerIssue + 1}`,
     );
     const evList: any[] = Array.isArray(evListRaw) ? evListRaw : [];
     if (evList.length > sentry.maxEventsPerIssue) truncated = true;
     for (const ev of evList.slice(0, sentry.maxEventsPerIssue)) {
       const eventId = ev.eventID ?? ev.id;
       const detail = await get(`/api/0/projects/${sentry.org}/${project}/events/${eventId}/`);
-      events.push(normalizeSentryEvent(detail, String(issue.id), issue.permalink));
+      const normalized = normalizeSentryEvent(detail, String(issue.id), issue.permalink);
+      // Keep ONLY events actually attached to THIS job: verify the uploadJobId tag
+      // equals the input id. The query above filters server-side; this guarantees it
+      // regardless of how the endpoint honors the query (issue events are not
+      // job-scoped, so a mismatched event must never be attributed to this job).
+      if (!tagKey || normalized.tags[tagKey] === id) events.push(normalized);
     }
   }
   return { project, query, events, truncated };
@@ -387,11 +408,12 @@ export async function fetchSentryForJob(
   get: HttpGet,
 ): Promise<SentryContext[]> {
   const query = renderSentryQuery(cfg.sentry.queryTemplate, id);
+  const tagKey = tagKeyFromTemplate(cfg.sentry.queryTemplate);
   const out: SentryContext[] = [];
   // Sentry is best-effort context: a failing project must not kill the fetch.
   for (const project of cfg.sentry.projects) {
     try {
-      out.push(await fetchSentryProject(project, query, cfg.sentry, get));
+      out.push(await fetchSentryProject(project, query, id, tagKey, cfg.sentry, get));
     } catch (err) {
       out.push({
         project,
