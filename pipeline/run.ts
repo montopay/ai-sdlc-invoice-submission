@@ -1318,6 +1318,11 @@ async function runStageImplement(
       stage: "implement",
     });
 
+    // The implement agent may READ the KB but must never WRITE it — the curator is the
+    // sole KB writer. Discard any KB changes it made so they can't dirty the tree and
+    // block the curator's learning-loop commit.
+    discardKbChanges(ctx.paths.knowledgeDir);
+
     console.log("----- implement agent report -----\n");
     console.log(report);
     console.log("\n-------------------------------\n");
@@ -1832,6 +1837,23 @@ function applyProposalToBranch(
 function resetBranch(kbDir: string, original: string, branch: string): void {
   runGit(kbDir, ["checkout", original]);
   runGit(kbDir, ["branch", "-D", branch]);
+}
+
+// Enforces "only the curator writes the KB". The fix stages (implement/test) may READ
+// the KB for context but must never WRITE it — the curator is the sole KB writer (it
+// records new handlers/fields in the learning loop). If a fix agent edited the KB anyway
+// (e.g. following a stray "update the field catalog" instruction), discard those changes
+// so they can't dirty the tree and block the curator's commit (runCurator bails on any
+// uncommitted KB change). Reverts tracked edits and removes new untracked files.
+function discardKbChanges(kbDir: string): void {
+  if (!kbDir || !existsSync(kbDir)) return;
+  const status = runGit(kbDir, ["status", "--porcelain"]);
+  if (!status.ok || status.stdout.length === 0) return;
+  console.log(
+    `Discarding uncommitted KB changes in ${kbDir} left by a fix stage — the curator is the sole KB writer.`,
+  );
+  runGit(kbDir, ["checkout", "--", "."]);
+  runGit(kbDir, ["clean", "-fd"]);
 }
 
 // The high-level prose the curator emits AROUND its file blocks — the NO CHANGE

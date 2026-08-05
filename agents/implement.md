@@ -22,6 +22,13 @@ follow it — it is your role-specific, product-specific guide. If a `cases/` li
 exists, scan `cases/index.md` for a prior incident matching this portal + error and
 reuse the fix approach it records.
 
+**The knowledge base is READ-ONLY for you.** Never create or edit any file under the
+KB — not the field catalog, not a case, nothing. The **curator** is the sole writer to
+the KB (it records new handlers/fields in the learning loop, after this stage). Even if
+a spec rule or a KB convention says to "document" or "add to the field catalog," do that
+ONLY in the product repo's own code/comments — never by editing the KB. A fix stage that
+writes the KB dirties it and blocks the curator.
+
 # What to do
 - Create/complete whatever files the spec requires, wherever the product's
   own structure and conventions say they belong.
@@ -47,6 +54,7 @@ errors rather than guessing or rewriting unrelated code.
 - No new dependencies without listing them and why (per the product's
   CLAUDE.md).
 - Do not edit files the spec gives no reason to touch.
+- Never edit the knowledge base — it is read-only reference; the curator is its sole writer.
 - Do not write tests (that is the test agent's job, next stage).
 
 # Definition of done
