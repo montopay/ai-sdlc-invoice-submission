@@ -153,6 +153,37 @@ function treeKill(pid: number): void {
   }
 }
 
+// The last run that STARTED but never emitted its run_finished — an "open" run.
+// Abort uses this as a fallback when there is NO live run.lock.json: a run whose
+// orchestrator died (or was killed) leaves events.jsonl ending on an unfinished run
+// (e.g. awaiting_approval) with no lock, so the old lock-only abort was a no-op and the
+// dashboard kept showing it as live forever. Returns { ticket, runId } of that orphan,
+// or null when the last run already finished.
+function latestOpenRun(): { ticket: string; runId: string } | null {
+  let text: string;
+  try {
+    text = readFileSync(resolve(ROOT, "events.jsonl"), "utf8");
+  } catch {
+    return null;
+  }
+  let open: { ticket: string; runId: string } | null = null;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let e: any;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.type === "run_started" && typeof e.ticket === "string" && typeof e.runId === "string") {
+      open = { ticket: e.ticket, runId: e.runId };
+    } else if (e.type === "run_finished" && open && e.runId === open.runId) {
+      open = null;
+    }
+  }
+  return open;
+}
+
 // The write route. Security first (Host, header, content-type, Origin), then the
 // 64KB-capped body, then per-cmd validation and the narrow side effect.
 async function handleCommand(
@@ -292,24 +323,38 @@ async function handleCommand(
   }
 
   if (cmd === "abort") {
-    // Stop the in-progress run: tree-kill the orchestrator (+ its agent/Chromium
-    // children) via the pid in run.lock.json. A force-kill means the orchestrator's
-    // own cleanup (releaseRunLock, run_finished) won't run, so we do it here:
-    // record run_finished(aborted) so the dashboard reflects it, clear the lock so
-    // a new run can start, and remove this run's pending approval files.
+    // Stop the in-progress run and mark it aborted so the dashboard stops showing it
+    // as live. Normally the pid comes from run.lock.json: tree-kill the orchestrator
+    // (+ its agent/Chromium children), since a force-kill skips the orchestrator's own
+    // cleanup (releaseRunLock, run_finished). But a run whose orchestrator ALREADY died
+    // leaves no lock while events.jsonl still ends on an unfinished run (awaiting
+    // approval) — an orphan the old lock-only path couldn't clear. So: kill via the lock
+    // when one is live, and mark aborted whichever run is open (the lock's, else the last
+    // unfinished run in events.jsonl).
     const lockPath = resolve(APPROVALS, "run.lock.json");
     let lock: any = null;
     try {
       lock = JSON.parse(readFileSync(lockPath, "utf8"));
     } catch {
-      return sendJson(200, { ok: true, note: "no run in progress" });
+      lock = null; // no (or unparseable) lock — fall back to the events.jsonl orphan below
     }
-    if (!lock || typeof lock.pid !== "number") return sendJson(200, { ok: true, note: "no run in progress" });
-    treeKill(lock.pid);
+    if (lock && typeof lock.pid === "number") treeKill(lock.pid);
+
+    let ticket: string | undefined = lock?.ticket;
+    let runId: string | undefined = lock?.runId;
+    if (!ticket || !runId) {
+      const open = latestOpenRun();
+      if (open) {
+        ticket = open.ticket;
+        runId = open.runId;
+      }
+    }
+    if (!ticket) return sendJson(200, { ok: true, note: "no run in progress" });
+
     try {
       appendFileSync(
         resolve(ROOT, "events.jsonl"),
-        JSON.stringify({ ts: new Date().toISOString(), type: "run_finished", ticket: lock.ticket, runId: lock.runId, outcome: "aborted" }) + "\n"
+        JSON.stringify({ ts: new Date().toISOString(), type: "run_finished", ticket, runId, outcome: "aborted" }) + "\n"
       );
     } catch { /* best effort */ }
     try { unlinkSync(lockPath); } catch { /* already gone */ }
@@ -321,7 +366,7 @@ async function handleCommand(
         }
       }
     } catch { /* no dir */ }
-    return sendJson(200, { ok: true, aborted: lock.ticket });
+    return sendJson(200, { ok: true, aborted: ticket });
   }
 
   return sendJson(400, { error: "unknown cmd" });
