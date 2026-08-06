@@ -104,7 +104,11 @@ A single markdown block, led by a TL;DR and then exactly these sections:
    "AC-1: login waits for the OTP field to appear before typing the TOTP code",
    not "fix login"). These IDs are load-bearing: downstream stages key their work
    to them — give every criterion exactly one stable ID, never reuse or renumber
-   on a re-run, and keep them contiguous (AC-1, AC-2, …). If the Resolution is a
+   on a re-run, and keep them contiguous (AC-1, AC-2, …). **ACs cover the product-repo
+   code fix ONLY** — never write an AC for a knowledge-base or documentation change
+   (the field catalog, a case, etc.). The KB is maintained by the curator in the
+   learning loop; a fix stage editing it would dirty the KB and block the curator. If
+   the Resolution is a
    `no-fix` verdict there is no code fix to satisfy — write `_None — no code change
    (see Resolution)_` here instead of AC-N, and the pipeline skips the fix stages.
 5. **Decisions & open questions** — assumptions you made (e.g. "not reproducible
